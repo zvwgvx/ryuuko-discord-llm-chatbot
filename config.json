@@ -1,0 +1,18 @@
+{
+  "DISCORD_TOKEN": "",
+  "OPENAI_API_KEY": "",
+  "OPENAI_API_BASE": "",
+  "OPENAI_MODEL": "",
+  
+  "GEMINI_API_KEY": "",
+  "OWNER_GEMINI_API_KEY": "",
+  
+  "USE_MONGODB": true,
+  "MONGODB_CONNECTION_STRING": "",
+  "MONGODB_DATABASE_NAME": "discord_openai_proxy",
+  
+  "REQUEST_TIMEOUT": 100,
+  "MAX_MSG": 1900,
+  "MEMORY_MAX_PER_USER": 100,
+  "MEMORY_MAX_TOKENS": 3000
+}
