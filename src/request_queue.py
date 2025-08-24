@@ -68,9 +68,13 @@ class RequestQueue:
         except Exception:
             return False
     
+    # Replace the add_request method in request_queue.py
+
+    # Replace the add_request method in request_queue.py with this fixed version:
+
     async def add_request(self, message: discord.Message, final_user_text: str) -> tuple[bool, str]:
         """
-        Add a request to queue
+        Add a request to queue - FIXED VERSION
         Returns: (success: bool, message: str)
         """
         self._ensure_queue_initialized()
@@ -80,24 +84,48 @@ class RequestQueue:
         
         # Check if user already has a request being processed
         if user_id in self._processing_users:
-            return False, "⏳ You have a request being processed. Please wait."
+            return False, "⏳ You have a request being processed. Please wait for it to complete."
+        
+        # Check if user already has requests in queue - IMPROVED CHECK
+        user_has_queued_request = False
+        temp_queue_items = []
+        
+        # Drain the queue to check for existing user requests
+        while not self._queue.empty():
+            try:
+                item = self._queue.get_nowait()
+                temp_queue_items.append(item)
+                if item.user_id == user_id:
+                    user_has_queued_request = True
+            except asyncio.QueueEmpty:
+                break
+        
+        # Put all items back in the queue
+        for item in temp_queue_items:
+            await self._queue.put(item)
+        
+        if user_has_queued_request:
+            return False, "⏳ You already have a request in queue. Please wait."
         
         # Rate limiting (except for owner)
         is_owner = await self.is_owner(message.author)
         if not is_owner:
             last_request = self._user_last_request.get(user_id, 0)
-            if current_time - last_request < 10.0:  # 10 second cooldown
-                remaining = 5.0 - (current_time - last_request)
+            if current_time - last_request < 3.0:  # Reduced to 3 seconds for faster testing
+                remaining = 3.0 - (current_time - last_request)
                 return False, f"⏰ Please wait {remaining:.1f}s before sending another request."
         
-        # Create request
+        # Create request with EXACT text from the current message
         request = QueuedRequest(
             message=message,
             user_id=user_id,
             is_owner=is_owner,
             timestamp=current_time,
-            final_user_text=final_user_text
+            final_user_text=final_user_text  # Make sure this is the CURRENT request text
         )
+        
+        # Log the request being added
+        logger.info(f"Adding request to queue for user {user_id}: {final_user_text[:100]}")
         
         # Add to queue
         await self._queue.put(request)
@@ -107,19 +135,7 @@ class RequestQueue:
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = asyncio.create_task(self._worker())
         
-        # Send queue status
-        queue_size = self._queue.qsize()
-        processing_count = len(self._processing_users)
-        
-        if is_owner:
-            status_msg = "👑 Owner request prioritized for processing..."
-        elif queue_size == 1 and processing_count == 0:
-            status_msg = "🤖 Processing your request..."
-        else:
-            status_msg = f"📋 Request added to queue. Position: {queue_size}, Processing: {processing_count}"
-        
-        return True, status_msg
-    
+        return True, None
     async def _worker(self):
         """Background worker to process queued requests"""
         logger.info("Request queue worker started")

@@ -66,7 +66,7 @@ OPENAI_API_BASE = env_data.get("OPENAI_API_BASE")
 OPENAI_MODEL = env_data.get("OPENAI_MODEL")
 
 # Gemini API configuration (NEW)
-GEMINI_API_KEY = env_data.get("GEMINI_API_KEY")
+CLIENT_GEMINI_API_KEY = env_data.get("CLIENT_GEMINI_API_KEY")
 OWNER_GEMINI_API_KEY = env_data.get("OWNER_GEMINI_API_KEY")  # New: Owner-specific key
 
 # MongoDB configuration
@@ -100,7 +100,7 @@ if OPENAI_MODEL and OPENAI_MODEL not in SUPPORTED_MODELS:
     logger.warning(f"MODEL {OPENAI_MODEL} not listed; should be monitored.")
 
 # Gemini API validation (optional)
-if GEMINI_API_KEY:
+if CLIENT_GEMINI_API_KEY:
     logger.info("Gemini API key found - Gemini models will be available")
 else:
     logger.warning("Gemini API key not found - Gemini models will not be available")

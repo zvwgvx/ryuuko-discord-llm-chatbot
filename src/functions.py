@@ -721,8 +721,8 @@ async def show_cmd(ctx: commands.Context, item: str = None, detail_or_user: str 
             2: "Premium (Level 2)"
         }.get(access_level, f"Unknown (Level {access_level})")
 
-        # Format display prompt
-        display_prompt = prompt[:500] + "...[truncated]" if len(prompt) > 500 else prompt
+        # Format display prompts
+        display_prompt = prompt[:500] + "...[truncated]" if len(prompt) > 700 else prompt
 
         # Build profile display
         lines = [
@@ -842,97 +842,166 @@ async def show_cmd(ctx: commands.Context, item: str = None, detail_or_user: str 
 # ------------------------------------------------------------------
 # AI Request Processing Function (used by queue)
 # ------------------------------------------------------------------
+# Replace your process_ai_request function in functions.py with this fixed version:
+
+# Fixed process_ai_request function - replace in functions.py
+
 async def process_ai_request(request):
-    """Process a single AI request from the queue"""
+    """Process a single AI request from the queue - COMPLETELY FIXED VERSION"""
     message = request.message
     final_user_text = request.final_user_text
+    user_id = message.author.id
     
-    # Get user model info first
-    if _use_mongodb_auth:
-        user_model = _user_config_manager.get_user_model(message.author.id)
-        model_info = _mongodb_store.get_model_info(user_model)
-        
-        if model_info:
-            cost = model_info.get("credit_cost", 0)
-            access_level = model_info.get("access_level", 0)
-            
-            # Check user access level
-            user_config = _user_config_manager.get_user_config(message.author.id)
-            user_level = user_config.get("access_level", 0)
-            
-            if user_level < access_level:
-                await message.channel.send(
-                    f"❌ This model requires {access_level} access level. Your level: {user_level}",
-                    reference=message,
-                    allowed_mentions=discord.AllowedMentions.none()
-                )
-                return
-
+    logger.info(f"Processing AI request for user {user_id}: {final_user_text[:100]}")
+    
     try:
-        # Build payload based on model type
-        user_system_message = _user_config_manager.get_user_system_message(message.author.id)
-        user_model = _user_config_manager.get_user_model(message.author.id)
-        user_memory = _memory_store.get_user_messages(message.author.id) if _memory_store else []
+        # Get user configuration first
+        user_system_message = _user_config_manager.get_user_system_message(user_id)
+        user_model = _user_config_manager.get_user_model(user_id)
+        
+        logger.info(f"User {user_id} using model: {user_model}")
+        
+        # Check model access and credits if MongoDB is enabled
+        if _use_mongodb_auth:
+            model_info = _mongodb_store.get_model_info(user_model)
+            
+            if model_info:
+                cost = model_info.get("credit_cost", 0)
+                required_access_level = model_info.get("access_level", 0)
+                
+                # Check user access level
+                user_config = _user_config_manager.get_user_config(user_id)
+                user_level = user_config.get("access_level", 0)
+                
+                if user_level < required_access_level:
+                    await message.channel.send(
+                        f"⛔ This model requires access level {required_access_level}. Your level: {user_level}",
+                        reference=message,
+                        allowed_mentions=discord.AllowedMentions.none()
+                    )
+                    return
 
-        # Build payload based on whether it's a Gemini model or not
-        if _call_api.is_gemini_model(user_model):
-            # For Gemini: Convert messages before sending to API
-            payload_messages = [user_system_message] + user_memory + [{"role": "user", "content": final_user_text}]
-        else:
-            # For OpenAI: Use standard format
-            payload_messages = [user_system_message] + user_memory + [{"role": "user", "content": final_user_text}]
-
-        # Call API with timeout handling
-        async with message.channel.typing():
-            loop = asyncio.get_running_loop()
-            ok, resp = await loop.run_in_executor(None, _call_api.call_openai_proxy, payload_messages, user_model)
-
-            if ok:
-                # Only deduct credits if API call succeeded
-                if _use_mongodb_auth and model_info:
-                    success, remaining = _mongodb_store.deduct_user_credit(message.author.id, cost)
-                    if not success:
+                # Check credits (but don't deduct yet)
+                if cost > 0:
+                    current_credit = user_config.get("credit", 0)
+                    if current_credit < cost:
                         await message.channel.send(
-                            f"❌ Insufficient credits. This model costs {cost} credits per use.",
+                            f"⛔ Insufficient credits. This model costs {cost} credits per use. Your balance: {current_credit}",
                             reference=message,
                             allowed_mentions=discord.AllowedMentions.none()
                         )
                         return
-                
-                # Store messages in memory after successful API call
-                # Store using OpenAI format for consistency in storage
-                if _memory_store:
-                    _memory_store.add_message(message.author.id, {"role": "user", "content": final_user_text})
-                    _memory_store.add_message(message.author.id, {"role": "assistant", "content": resp})
 
+        # Get existing conversation history
+        if _memory_store:
+            existing_memory = _memory_store.get_user_messages(user_id)
+            logger.info(f"Retrieved {len(existing_memory)} messages from memory for user {user_id}")
+        else:
+            existing_memory = []
+            logger.warning("Memory store not available")
+        
+        # Create the current user message
+        current_user_message = {"role": "user", "content": final_user_text}
+        
+        # Build the complete message payload
+        # Order: system message -> conversation history -> current message
+        payload_messages = [user_system_message] + existing_memory + [current_user_message]
+        
+        logger.info(f"Sending {len(payload_messages)} messages to API (system + {len(existing_memory)} history + 1 current)")
+        
+        # Debug: Log the last few messages
+        for i, msg in enumerate(payload_messages[-3:]):
+            logger.debug(f"Message {i}: {msg['role']}: {msg['content'][:50]}...")
+
+        # Call API with timeout handling
+        async with message.channel.typing():
+            loop = asyncio.get_running_loop()
+            
+            # Make the API call
+            ok, resp = await loop.run_in_executor(
+                None, 
+                _call_api.call_openai_proxy, 
+                payload_messages,
+                user_model
+            )
+
+            if ok and resp:
+                logger.info(f"API response received for user {user_id}: {resp[:100]}...")
+                
+                # Only deduct credits after successful API call
+                if _use_mongodb_auth and model_info and model_info.get("credit_cost", 0) > 0:
+                    cost = model_info.get("credit_cost", 0)
+                    success, remaining = _mongodb_store.deduct_user_credit(user_id, cost)
+                    if not success:
+                        logger.error(f"Failed to deduct credits for user {user_id} after successful API call")
+                        # Continue anyway since API call was successful
+                
+                # Create assistant response message
+                assistant_message = {"role": "assistant", "content": resp}
+                
+                # Add both messages to memory store atomically
+                if _memory_store:
+                    logger.info(f"Adding messages to memory for user {user_id}")
+                    
+                    # Add user message first
+                    success1 = _memory_store.add_message(user_id, current_user_message)
+                    if not success1:
+                        logger.error(f"Failed to add user message to memory for user {user_id}")
+                    
+                    # Add assistant message
+                    success2 = _memory_store.add_message(user_id, assistant_message)
+                    if not success2:
+                        logger.error(f"Failed to add assistant message to memory for user {user_id}")
+                    
+                    if success1 and success2:
+                        logger.info(f"Successfully added both messages to memory for user {user_id}")
+                    else:
+                        logger.warning(f"Memory storage partially failed for user {user_id}")
+                
                 # Format and send response
                 reply = (resp or "").strip() or "(no response from AI)"
                 reply = convert_latex_to_discord(reply)
-                await send_long_message_with_reference(message.channel, reply, message, _config.MAX_MSG)
+                
+                await send_long_message_with_reference(
+                    message.channel, 
+                    reply, 
+                    message, 
+                    _config.MAX_MSG
+                )
+                
+                logger.info(f"Response sent successfully to user {user_id}")
                 
             else:
-                # Handle timeout or other API errors
-                if "timeout" in str(resp).lower():
+                # Handle API errors
+                error_msg = resp or "Unknown API error"
+                logger.error(f"API error for user {user_id}: {error_msg}")
+                
+                if "timeout" in str(error_msg).lower():
                     await message.channel.send(
-                        "❌ Request timed out. Please try again.",
+                        "⏰ Request timed out. Please try again.",
+                        reference=message,
+                        allowed_mentions=discord.AllowedMentions.none()
+                    )
+                elif "safety" in str(error_msg).lower() or "blocked" in str(error_msg).lower():
+                    await message.channel.send(
+                        "🛡️ Response blocked by safety filters. Please rephrase your request.",
                         reference=message,
                         allowed_mentions=discord.AllowedMentions.none()
                     )
                 else:
                     await message.channel.send(
-                        f"❌ API Error: {resp}",
+                        f"⚠️ API Error: {error_msg}",
                         reference=message,
                         allowed_mentions=discord.AllowedMentions.none()
                     )
 
     except Exception as e:
-        logger.exception("Error in request processing")
+        logger.exception(f"Error in request processing for user {user_id}")
         await message.channel.send(
-            f"❌ Internal error: {e}",
+            f"⚠️ Internal error: {e}",
             reference=message,
             allowed_mentions=discord.AllowedMentions.none()
         )
-
 # ------------------------------------------------------------------
 # Fixed Message formatting helpers with proper table handling
 # ------------------------------------------------------------------
