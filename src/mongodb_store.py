@@ -96,8 +96,7 @@ class MongoDBStore:
                     {"model_name": "gemini-2.5-flash", "created_at": datetime.utcnow(), "is_default": True, "credit_cost": 10, "access_level": 0},
                     {"model_name": "gemini-2.5-pro", "created_at": datetime.utcnow(), "is_default": True, "credit_cost": 50, "access_level": 0},
                     {"model_name": "gpt-3.5-turbo", "created_at": datetime.utcnow(), "is_default": True, "credit_cost": 200, "access_level": 0},
-                    {"model_name": "gpt-5", "created_at": datetime.utcnow(), "is_default": True, "credit_cost": 700, "access_level": 1},
-
+                    {"model_name": "gpt-5", "created_at": datetime.utcnow(), "is_default": True, "credit_cost": 700, "access_level": 1}
                 ]
                 
                 self.db[self.COLLECTIONS['models']].insert_many(default_models)

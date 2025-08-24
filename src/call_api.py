@@ -1,6 +1,7 @@
 import logging
 import os
-from typing import List, Dict, Any, Tuple, Optional
+import asyncio  # Add this import
+from typing import List, Dict, Any, Tuple, Optional, AsyncIterator
 from openai import OpenAI
 import google.generativeai as genai
 import load_config
@@ -96,7 +97,9 @@ class GeminiConfig:
 
 def is_gemini_model(model_name: str) -> bool:
     """Check if the model is a Gemini model"""
-    return model_name.startswith("gemini-") or model_name.startswith("gemma-")
+    return (model_name.startswith("gemini-") or 
+            model_name.startswith("gemma-") or 
+            "live-preview" in model_name)
 
 def build_gemini_prompt(messages: List[Dict[str, str]]) -> str:
     """
@@ -271,6 +274,40 @@ def call_gemini_api(
         logger.exception(f"Error calling Gemini API: {e}")
         return False, f"Gemini API error: {str(e)}"
 
+async def call_gemini_api_stream(messages: List[Dict[str, str]], model: str, is_owner: bool = False) -> AsyncIterator[str]:
+    """Stream response from Gemini API"""
+    try:
+        # Configure API key
+        if is_owner and clients.owner_gemini_available:
+            genai.configure(api_key=load_config.OWNER_GEMINI_API_KEY)
+        elif clients.gemini_available:
+            genai.configure(api_key=load_config.CLIENT_GEMINI_API_KEY)
+        else:
+            yield "Gemini API not initialized"
+            return
+
+        # Create model instance with streaming
+        model_instance = genai.GenerativeModel(
+            model_name=model.replace("-live-preview", ""),
+            safety_settings=GeminiConfig.DEFAULT_SAFETY_SETTINGS
+        )
+
+        # Build prompt
+        prompt = build_gemini_prompt(messages)
+        
+        # Get streaming response
+        response = model_instance.generate_content(prompt, stream=True)
+        
+        # Convert sync iterator to async
+        for chunk in response:
+            if chunk.text:
+                yield chunk.text
+            await asyncio.sleep(0)  # Allow other coroutines to run
+
+    except Exception as e:
+        logger.exception(f"Error in Gemini stream: {e}")
+        yield f"Stream error: {str(e)}"
+
 def is_model_available(model: str) -> Tuple[bool, str]:
     """Check if a model is available for use"""
     if is_gemini_model(model):
@@ -339,3 +376,28 @@ def call_openai_proxy(
     except Exception as e:
         logger.exception(f"Error calling API for model {model}: {e}")
         return False, str(e)
+
+async def call_openai_proxy_stream(
+    messages: List[Dict[str, str]],
+    model: str = "gpt-3.5-turbo",
+    is_owner: bool = False
+) -> AsyncIterator[str]:
+    """Unified streaming API call handler"""
+    
+    # Check model availability
+    available, error = is_model_available(model)
+    if not available:
+        yield error
+        return
+        
+    if "live-preview" in model:
+        # Use Gemini streaming
+        async for chunk in call_gemini_api_stream(messages, model, is_owner):
+            yield chunk
+    else:
+        # Regular non-streaming call
+        ok, response = call_openai_proxy(messages, model, is_owner)
+        if ok:
+            yield response
+        else:
+            yield f"Error: {response}"

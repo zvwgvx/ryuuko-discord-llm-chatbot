@@ -11,6 +11,7 @@ import re
 import json
 import logging
 import asyncio
+import time
 from pathlib import Path
 from typing import Set, Optional, List, Dict
 
@@ -883,154 +884,105 @@ async def show_cmd(ctx: commands.Context, item: str = None, detail_or_user: str 
 
 # Fixed process_ai_request function - replace in functions.py
 
+async def deduct_credits(user_id: int, amount: int) -> bool:
+    """Deduct credits from user balance"""
+    if not _use_mongodb_auth or not _mongodb_store:
+        return True
+        
+    success, remaining = _mongodb_store.deduct_user_credit(user_id, amount)
+    if not success:
+        logger.error(f"Failed to deduct {amount} credits from user {user_id}")
+    else:
+        logger.info(f"Deducted {amount} credits from user {user_id}. Remaining: {remaining}")
+    return success
+
 async def process_ai_request(request):
-    """Process a single AI request from the queue - COMPLETELY FIXED VERSION"""
+    """Process a single AI request from the queue with stream support"""
     message = request.message
     final_user_text = request.final_user_text
     user_id = message.author.id
     
-    logger.info(f"Processing AI request for user {user_id}: {final_user_text[:100]}")
-    
     try:
-        # Get user configuration first
+        # Get user configuration
         user_system_message = _user_config_manager.get_user_system_message(user_id)
         user_model = _user_config_manager.get_user_model(user_id)
         
-        logger.info(f"User {user_id} using model: {user_model}")
-        
-        # Check model access and credits if MongoDB is enabled
+        # Check model access and credits
         if _use_mongodb_auth:
             model_info = _mongodb_store.get_model_info(user_model)
-            
-            if model_info:
-                cost = model_info.get("credit_cost", 0)
-                required_access_level = model_info.get("access_level", 0)
+            if not await check_model_access(message, model_info, user_id):
+                return
                 
-                # Check user access level
-                user_config = _user_config_manager.get_user_config(user_id)
-                user_level = user_config.get("access_level", 0)
-                
-                if user_level < required_access_level:
-                    await message.channel.send(
-                        f"⛔ This model requires access level {required_access_level}. Your level: {user_level}",
-                        reference=message,
-                        allowed_mentions=discord.AllowedMentions.none()
-                    )
-                    return
-
-                # Check credits (but don't deduct yet)
-                if cost > 0:
-                    current_credit = user_config.get("credit", 0)
-                    if current_credit < cost:
-                        await message.channel.send(
-                            f"⛔ Insufficient credits. This model costs {cost} credits per use. Your balance: {current_credit}",
-                            reference=message,
-                            allowed_mentions=discord.AllowedMentions.none()
-                        )
-                        return
-
-        # Get existing conversation history
+        # Build message payload
+        payload_messages = [user_system_message]
         if _memory_store:
-            existing_memory = _memory_store.get_user_messages(user_id)
-            logger.info(f"Retrieved {len(existing_memory)} messages from memory for user {user_id}")
-        else:
-            existing_memory = []
-            logger.warning("Memory store not available")
-        
-        # Create the current user message
-        current_user_message = {"role": "user", "content": final_user_text}
-        
-        # Build the complete message payload
-        # Order: system message -> conversation history -> current message
-        payload_messages = [user_system_message] + existing_memory + [current_user_message]
-        
-        logger.info(f"Sending {len(payload_messages)} messages to API (system + {len(existing_memory)} history + 1 current)")
-        
-        # Debug: Log the last few messages
-        for i, msg in enumerate(payload_messages[-3:]):
-            logger.debug(f"Message {i}: {msg['role']}: {msg['content'][:50]}...")
+            payload_messages.extend(_memory_store.get_user_messages(user_id))
+        payload_messages.append({"role": "user", "content": final_user_text})
 
-        # Call API with timeout handling
-        async with message.channel.typing():
-            loop = asyncio.get_running_loop()
+        # Create initial response message
+        response_msg = await message.channel.send(
+            "...",
+            reference=message,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+
+        # Stream or regular response
+        if "live-preview" in user_model:
+            collected_response = ""
+            last_update = 0
             
-            # Make the API call
-            ok, resp = await loop.run_in_executor(
-                None, 
-                _call_api.call_openai_proxy, 
+            # Process stream
+            async for chunk in _call_api.call_openai_proxy_stream(payload_messages, user_model):
+                collected_response += chunk
+                
+                # Update message every 1 second or when chunk is large
+                current_time = time.time()
+                if (current_time - last_update > 1 or len(chunk) > 100) and collected_response:
+                    formatted_response = convert_latex_to_discord(collected_response)
+                    try:
+                        await response_msg.edit(content=formatted_response)
+                        last_update = current_time
+                    except Exception as e:
+                        logger.error(f"Failed to update stream message: {e}")
+                        
+            # Final update and process completion
+            if collected_response:
+                final_response = convert_latex_to_discord(collected_response)
+                await response_msg.edit(content=final_response)
+                
+                # Save to memory store
+                if _memory_store:
+                    _memory_store.add_message(user_id, {"role": "user", "content": final_user_text})
+                    _memory_store.add_message(user_id, {"role": "assistant", "content": collected_response})
+                    
+                # Deduct credits after successful completion
+                if _use_mongodb_auth and model_info:
+                    await deduct_credits(user_id, model_info.get("credit_cost", 0))
+                    
+        else:
+            # Regular non-streaming call - existing code remains unchanged
+            ok, resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                _call_api.call_openai_proxy,
                 payload_messages,
                 user_model
             )
-
+            
             if ok and resp:
-                logger.info(f"API response received for user {user_id}: {resp[:100]}...")
+                formatted_response = convert_latex_to_discord(resp)
+                await response_msg.edit(content=formatted_response)
                 
-                # Only deduct credits after successful API call
-                if _use_mongodb_auth and model_info and model_info.get("credit_cost", 0) > 0:
-                    cost = model_info.get("credit_cost", 0)
-                    success, remaining = _mongodb_store.deduct_user_credit(user_id, cost)
-                    if not success:
-                        logger.error(f"Failed to deduct credits for user {user_id} after successful API call")
-                        # Continue anyway since API call was successful
-                
-                # Create assistant response message
-                assistant_message = {"role": "assistant", "content": resp}
-                
-                # Add both messages to memory store atomically
+                # Save to memory store
                 if _memory_store:
-                    logger.info(f"Adding messages to memory for user {user_id}")
-                    
-                    # Add user message first
-                    success1 = _memory_store.add_message(user_id, current_user_message)
-                    if not success1:
-                        logger.error(f"Failed to add user message to memory for user {user_id}")
-                    
-                    # Add assistant message
-                    success2 = _memory_store.add_message(user_id, assistant_message)
-                    if not success2:
-                        logger.error(f"Failed to add assistant message to memory for user {user_id}")
-                    
-                    if success1 and success2:
-                        logger.info(f"Successfully added both messages to memory for user {user_id}")
-                    else:
-                        logger.warning(f"Memory storage partially failed for user {user_id}")
+                    _memory_store.add_message(user_id, {"role": "user", "content": final_user_text})
+                    _memory_store.add_message(user_id, {"role": "assistant", "content": resp})
                 
-                # Format and send response
-                reply = (resp or "").strip() or "(no response from AI)"
-                reply = convert_latex_to_discord(reply)
-                
-                await send_long_message_with_reference(
-                    message.channel, 
-                    reply, 
-                    message, 
-                    _config.MAX_MSG
-                )
-                
-                logger.info(f"Response sent successfully to user {user_id}")
-                
+                # Deduct credits after successful completion    
+                if _use_mongodb_auth and model_info:
+                    await deduct_credits(user_id, model_info.get("credit_cost", 0))
             else:
-                # Handle API errors
-                error_msg = resp or "Unknown API error"
-                logger.error(f"API error for user {user_id}: {error_msg}")
-                
-                if "timeout" in str(error_msg).lower():
-                    await message.channel.send(
-                        "⏰ Request timed out. Please try again.",
-                        reference=message,
-                        allowed_mentions=discord.AllowedMentions.none()
-                    )
-                elif "safety" in str(error_msg).lower() or "blocked" in str(error_msg).lower():
-                    await message.channel.send(
-                        "🛡️ Response blocked by safety filters. Please rephrase your request.",
-                        reference=message,
-                        allowed_mentions=discord.AllowedMentions.none()
-                    )
-                else:
-                    await message.channel.send(
-                        f"⚠️ API Error: {error_msg}",
-                        reference=message,
-                        allowed_mentions=discord.AllowedMentions.none()
-                    )
+                error_msg = resp or "Unknown error"
+                await response_msg.edit(content=f"❌ Error: {error_msg}")
 
     except Exception as e:
         logger.exception(f"Error in request processing for user {user_id}")
@@ -1039,6 +991,40 @@ async def process_ai_request(request):
             reference=message,
             allowed_mentions=discord.AllowedMentions.none()
         )
+
+# Add helper functions
+async def check_model_access(message, model_info, user_id) -> bool:
+    """Check if user has access to model"""
+    if not model_info:
+        return True
+        
+    # Check level
+    user_config = _user_config_manager.get_user_config(user_id)
+    user_level = user_config.get("access_level", 0)
+    required_level = model_info.get("access_level", 0)
+    
+    if user_level < required_level:
+        await message.channel.send(
+            f"⛔ This model requires access level {required_level}. Your level: {user_level}",
+            reference=message,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        return False
+        
+    # Check credits
+    cost = model_info.get("credit_cost", 0)
+    if cost > 0:
+        current_credit = user_config.get("credit", 0)
+        if current_credit < cost:
+            await message.channel.send(
+                f"⛔ Insufficient credits. This model costs {cost} credits per use. Your balance: {current_credit}",
+                reference=message,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            return False
+            
+    return True
+
 # ------------------------------------------------------------------
 # Fixed Message formatting helpers with proper table handling
 # ------------------------------------------------------------------
