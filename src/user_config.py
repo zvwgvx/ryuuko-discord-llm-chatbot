@@ -90,11 +90,14 @@ class UserConfigManager:
             logger.exception(f"Error saving user_config.json: {e}")
     
     def get_supported_models(self) -> Set[str]:
-        """Get supported models from database (or fallback for file mode)"""
+        """Get set of all supported model names"""
         if self.use_mongodb:
-            return self.mongo_store.get_supported_models()
+            # Get both regular and profile models
+            models = self.mongo_store.get_supported_models()
+            profiles = {p['name'] for p in self.mongo_store.list_profile_models()}
+            return models.union(profiles)
         else:
-            # File mode fallback
+            # Legacy file mode
             return FALLBACK_SUPPORTED_MODELS
     
     def add_supported_model(self, model_name: str, credit_cost: int = 1, access_level: int = 0) -> tuple[bool, str]:

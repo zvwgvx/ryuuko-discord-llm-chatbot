@@ -253,6 +253,13 @@ async def help_cmd(ctx: commands.Context):
             "  - credit_cost: Cost in credits per use",
             "  - access_level: Required user level (0=Basic, 1=Advanced, 2=Premium, 3=Ultimate)",
             "`;remove model <model_name>` – Remove a model",
+            "",
+            "**Profile Model Management (owner only):**",
+            "`;add pmodel <name>` - Create new profile model",
+            "  - Interactive setup for base_model, sys_prompt, etc.",
+            "`;edit pmodel <name> <field> <value>` - Edit profile model",
+            "  - fields: base_model, sys_prompt, cost, level, is_live",
+            "`;show pmodels` - List all profile models"
         ]
 
     await ctx.send("\n".join(lines), allowed_mentions=discord.AllowedMentions.none())
@@ -352,7 +359,6 @@ async def clearmemory_cmd(ctx: commands.Context, target: discord.Member = None):
 # NEW: Add command dispatcher (owner only)
 # ------------------------------------------------------------------
 async def add_cmd(ctx: commands.Context, resource_type: str = None, *, value: str = None):
-    """Add command dispatcher - handles: add model <model_name> <credit_cost> <access_level>, add credit @user <amount>"""
     try:
         is_owner = await _bot.is_owner(ctx.author)
     except Exception:
@@ -362,14 +368,24 @@ async def add_cmd(ctx: commands.Context, resource_type: str = None, *, value: st
         await ctx.send("This command is only available to the bot owner.", 
                       allowed_mentions=discord.AllowedMentions.none())
         return
-    
+
     if resource_type is None:
-        await ctx.send("Usage:\n`;add model <model_name> <credit_cost> <access_level>`\n`;add credit @user <amount>`", 
+        await ctx.send("Usage:\n`;add model <model_name> <credit_cost> <access_level>`\n`;add credit @user <amount>`\n`;add pmodel <name>`", 
                       allowed_mentions=discord.AllowedMentions.none())
         return
     
     resource_type = resource_type.lower()
     
+    if resource_type == "pmodel":
+        if not value:
+            await ctx.send("Please specify a profile model name.", allowed_mentions=discord.AllowedMentions.none())
+            return
+            
+        name = value.strip()
+        success, message = _mongodb_store.add_profile_model(name)
+        await ctx.send(message, allowed_mentions=discord.AllowedMentions.none())
+        return
+
     if resource_type == "model":
         if not value:
             await ctx.send("Usage: `;add model <model_name> <credit_cost> <access_level>`\nExample: `;add model gpt-6 5 2`", 
@@ -442,6 +458,76 @@ async def add_cmd(ctx: commands.Context, resource_type: str = None, *, value: st
         else:
             await ctx.send("Credit system requires MongoDB mode", 
                           allowed_mentions=discord.AllowedMentions.none())
+    elif resource_type == "pmodel":
+        if not value:
+            await ctx.send("Please specify a profile model name.", allowed_mentions=discord.AllowedMentions.none())
+            return
+            
+        name = value.strip()
+        
+        # Interactive setup
+        await ctx.send("Please enter the base model name:", allowed_mentions=discord.AllowedMentions.none())
+        try:
+            base_model_msg = await bot.wait_for(
+                'message',
+                check=lambda m: m.author == ctx.author and m.channel == ctx.channel,
+                timeout=30.0
+            )
+            base_model = base_model_msg.content.strip()
+            
+            await ctx.send("Please enter the system prompt:", allowed_mentions=discord.AllowedMentions.none())
+            sys_prompt_msg = await bot.wait_for(
+                'message', 
+                check=lambda m: m.author == ctx.author and m.channel == ctx.channel,
+                timeout=60.0
+            )
+            sys_prompt = sys_prompt_msg.content
+            
+            await ctx.send("Enter credit cost (default: 0):", allowed_mentions=discord.AllowedMentions.none())
+            cost_msg = await bot.wait_for(
+                'message',
+                check=lambda m: m.author == ctx.author and m.channel == ctx.channel,
+                timeout=30.0
+            )
+            try:
+                cost = int(cost_msg.content)
+            except:
+                cost = 0
+                
+            await ctx.send("Enter access level (0-3, default: 0):", allowed_mentions=discord.AllowedMentions.none())
+            level_msg = await bot.wait_for(
+                'message',
+                check=lambda m: m.author == ctx.author and m.channel == ctx.channel,
+                timeout=30.0
+            )
+            try:
+                level = int(level_msg.content)
+                if level not in [0,1,2,3]:
+                    level = 0
+            except:
+                level = 0
+                
+            await ctx.send("Enable live preview? (yes/no, default: no):", allowed_mentions=discord.AllowedMentions.none())
+            live_msg = await bot.wait_for(
+                'message',
+                check=lambda m: m.author == ctx.author and m.channel == ctx.channel,
+                timeout=30.0
+            )
+            is_live = live_msg.content.lower() in ['yes', 'y', 'true', '1']
+            
+            success, message = _mongodb_store.add_profile_model(
+                name=name,
+                base_model=base_model,
+                sys_prompt=sys_prompt,
+                credit_cost=cost,
+                access_level=level,
+                is_live=is_live
+            )
+            
+            await ctx.send(message, allowed_mentions=discord.AllowedMentions.none())
+            
+        except asyncio.TimeoutError:
+            await ctx.send("Setup timed out. Please try again.", allowed_mentions=discord.AllowedMentions.none())
     else:
         await ctx.send(f"Unknown resource type '{resource_type}'. Available: `model` or `credit`", 
                       allowed_mentions=discord.AllowedMentions.none())
@@ -554,6 +640,26 @@ async def edit_cmd(ctx: commands.Context, resource_type: str = None, *, value: s
         success, message = _mongodb_store.edit_supported_model(model_name, credit_cost, access_level)
         await ctx.send(message, allowed_mentions=discord.AllowedMentions.none())
         
+    elif resource_type == "pmodel":
+        if not value:
+            await ctx.send("Usage: `;edit pmodel <name> <field> <value>`", allowed_mentions=discord.AllowedMentions.none())
+            return
+            
+        try:
+            args = value.split(maxsplit=2)
+            if len(args) < 3:
+                raise ValueError("Need name, field and value")
+                
+            name = args[0].strip()
+            field = args[1].strip().lower()
+            new_value = args[2].strip()
+            
+            success, message = _mongodb_store.edit_profile_model(name, field, new_value)
+            await ctx.send(message, allowed_mentions=discord.AllowedMentions.none())
+            
+        except ValueError as e:
+            await ctx.send(str(e), allowed_mentions=discord.AllowedMentions.none())
+            
     else:
         await ctx.send(f"Unknown resource type '{resource_type}'. Available: `model`", 
                       allowed_mentions=discord.AllowedMentions.none())
@@ -578,22 +684,43 @@ async def set_cmd(ctx: commands.Context, attribute: str = None, *, value: str = 
     
     if attribute == "model":
         if value is None:
-            # Get supported models from database
-            supported_models = _user_config_manager.get_supported_models()
-            supported_list = ", ".join(sorted(supported_models))
+            # Get both regular and profile models
+            all_models = []
+            if _use_mongodb_auth:
+                # Get regular models
+                regular_models = _mongodb_store.list_all_models()
+                all_models.extend([m.get("model_name") for m in regular_models])
+                
+                # Get profile models
+                profile_models = _mongodb_store.list_profile_models()
+                all_models.extend([p.get("name") for p in profile_models])
+            else:
+                all_models = list(_user_config_manager.get_supported_models())
+                
+            supported_list = ", ".join(sorted(all_models))
             await ctx.send(f"Please specify a model. Example: `;set model gpt-oss-120b`\n**Available models:** {supported_list}", 
                           allowed_mentions=discord.AllowedMentions.none())
             return
-        
-        # Check model availability before setting
-        available, error = _call_api.is_model_available(value.strip())
-        if not available:
-            await ctx.send(error, allowed_mentions=discord.AllowedMentions.none())
+
+        # Check if value is a profile model first
+        profile_model = None
+        if _use_mongodb_auth:
+            profile_model = _mongodb_store.get_profile_model(value.strip())
+
+        if profile_model:
+            success, message = _user_config_manager.set_user_model(ctx.author.id, value.strip())
+            await ctx.send(f"Successfully set model to profile: {value.strip()}", allowed_mentions=discord.AllowedMentions.none())
             return
-        
-        success, message = _user_config_manager.set_user_model(ctx.author.id, value.strip())
-        await ctx.send(message, allowed_mentions=discord.AllowedMentions.none())
-        
+        else:
+            # Regular model handling
+            available, error = _call_api.is_model_available(value.strip())
+            if not available:
+                await ctx.send(error, allowed_mentions=discord.AllowedMentions.none())
+                return
+
+            success, message = _user_config_manager.set_user_model(ctx.author.id, value.strip())
+            await ctx.send(message, allowed_mentions=discord.AllowedMentions.none())
+
     elif attribute == "sys_prompt":
         if value is None:
             await ctx.send("Please provide a system prompt. Example: `;set sys_prompt You are a helpful AI assistant`", 
@@ -658,15 +785,37 @@ async def set_cmd(ctx: commands.Context, attribute: str = None, *, value: str = 
 # Show command dispatcher (updated)
 # ------------------------------------------------------------------
 async def show_cmd(ctx: commands.Context, item: str = None, detail_or_user: str = None):
-    """Show command dispatcher - handles: show profile, show sys_prompt, show profile @user (owner), show model"""
     if item is None:
-        await ctx.send("Usage: `;show profile`, `;show sys_prompt [@user]`, `;show model`", 
+        await ctx.send("Usage: `;show profile`, `;show sys_prompt [@user]`, `;show model`, `;show pmodel [name]`", 
                       allowed_mentions=discord.AllowedMentions.none())
         return
     
     item = item.lower()
     
-    if item == "profile":
+    # Add pmodel handler before profile handler
+    if item == "pmodel":
+        if detail_or_user:
+            # Show specific profile model
+            success, message = _mongodb_store.get_profile_model_details(detail_or_user)
+            await ctx.send(message, allowed_mentions=discord.AllowedMentions.none())
+        else:
+            # List all profile models
+            all_profiles = _mongodb_store.list_profile_models()
+            if all_profiles:
+                lines = ["**Profile Models:**"]
+                for p in all_profiles:
+                    name = p.get("name", "Unknown")
+                    base = p.get("base_model", "Not set")
+                    cost = p.get("credit_cost", 0)
+                    level = p.get("access_level", 0)
+                    is_live = "✅" if p.get("is_live") else "❌"
+                    lines.append(f"• `{name}` -> {base} (Cost: {cost}, Level: {level}, Live: {is_live})")
+            else:
+                lines = ["No profile models found."]
+            await ctx.send("\n".join(lines), allowed_mentions=discord.AllowedMentions.none())
+        return
+
+    elif item == "profile":
         # The profile command is public: **anyone** can invoke it.
         # Optional target member: 1st argument if present.
         target_user: Optional[discord.Member] = None
@@ -765,7 +914,7 @@ async def show_cmd(ctx: commands.Context, item: str = None, detail_or_user: str 
         prompt = user_config["system_prompt"]
         
         # Format display
-        lines = [
+        lines = [   
             f"**📝 System Prompt for {target_user}:**",
             "```",
             prompt,
@@ -782,19 +931,42 @@ async def show_cmd(ctx: commands.Context, item: str = None, detail_or_user: str 
         if _use_mongodb_auth:
             # Get models with their details from MongoDB
             all_models = _mongodb_store.list_all_models()
-            if all_models:
+            all_pmodels = _mongodb_store.list_profile_models() 
+
+            # Combine regular models and profile models
+            if all_models or all_pmodels:
                 models_info = []
-                # Sort models by level (descending) and then by cost (descending)
-                sorted_models = sorted(all_models, 
-                                    key=lambda x: (-x.get("access_level", 0),  # Negative for descending level
-                                                 -x.get("credit_cost", 0),     # Negative for descending cost
-                                                 x.get("model_name", "")))     # Then by name ascending
+                
+                # Combine and sort all models
+                combined_models = []
+                
+                # Add regular models
+                for model in all_models:
+                    combined_models.append({
+                        "name": model.get("model_name", "Unknown"),
+                        "credit_cost": model.get("credit_cost", 0),
+                        "access_level": model.get("access_level", 0),
+                    })
+                
+                # Add profile models
+                for pmodel in all_pmodels:
+                    combined_models.append({
+                        "name": pmodel.get("name", "Unknown"),
+                        "credit_cost": pmodel.get("credit_cost", 0),
+                        "access_level": pmodel.get("access_level", 0),
+                    })
+                
+                # Sort all models together
+                sorted_models = sorted(
+                    combined_models, 
+                    key=lambda x: (-x["access_level"], -x["credit_cost"], x["name"])
+                )
                 
                 current_level = None
                 for model in sorted_models:
-                    model_name = model.get("model_name", "Unknown")
-                    credit_cost = model.get("credit_cost", 0)
-                    access_level = model.get("access_level", 0)
+                    model_name = model["name"]
+                    credit_cost = model["credit_cost"]
+                    access_level = model["access_level"]
                     level_names = {0: "Basic", 1: "Advanced", 2: "Premium", 3: "Ultimate"}
                     level_name = level_names.get(access_level, f"Level {access_level}")
                     
@@ -812,7 +984,8 @@ async def show_cmd(ctx: commands.Context, item: str = None, detail_or_user: str 
                     "Use `;set model <model_name>` to change your model."
                 ]
             else:
-                lines = ["No models found in database."]
+                lines = ["No models found."]
+
         else:
             # Fallback for file mode
             supported_models = _user_config_manager.get_supported_models()
@@ -872,7 +1045,22 @@ async def show_cmd(ctx: commands.Context, item: str = None, detail_or_user: str 
         else:
             await ctx.send(f"**Authorized users list:**\n{body}",
                            allowed_mentions=discord.AllowedMentions.none())
-
+    elif item == "pmodels":
+        all_profiles = _mongodb_store.list_profile_models()
+        if all_profiles:
+            lines = ["**Profile Models:**"]
+            for p in all_profiles:
+                name = p.get(" - name", "Unknown")
+                base = p.get(" - base_model", "Unknown")
+                cost = p.get(" - credit_cost", 0)
+                level = p.get(" - access_level", 0)
+                is_live = "✅" if p.get("is_live") else "❌"
+                lines.append(f"• `{name}` -> {base} (Cost: {cost}, Level: {level}, Live: {is_live})")
+        else:
+            lines = ["No profile models found."]
+            
+        await ctx.send("\n".join(lines), allowed_mentions=discord.AllowedMentions.none())
+        
     else:
         await ctx.send(
             f"Unknown item {item}. Use `config`, `model`, `models detailed` (owner) or `auth` (owner).",
@@ -904,15 +1092,33 @@ async def process_ai_request(request):
     
     try:
         # Get user configuration
-        user_system_message = _user_config_manager.get_user_system_message(user_id)
         user_model = _user_config_manager.get_user_model(user_id)
         
-        # Check model access and credits
+        # Check if using a profile model
+        profile = None
         if _use_mongodb_auth:
-            model_info = _mongodb_store.get_model_info(user_model)
+            profile = _mongodb_store.get_profile_model(user_model)
+        
+        if profile:
+            # Use profile settings
+            user_model = profile["base_model"]
+            user_system_message = {"role": "system", "content": profile["sys_prompt"]}
+            is_live = profile.get("is_live", False)
+            
+            # Check access level and credits
+            model_info = {"credit_cost": profile["credit_cost"], "access_level": profile["access_level"]}
             if not await check_model_access(message, model_info, user_id):
                 return
-                
+        else:
+            # Use regular user settings
+            user_system_message = _user_config_manager.get_user_system_message(user_id)
+            is_live = "live-preview" in user_model
+            
+            if _use_mongodb_auth:
+                model_info = _mongodb_store.get_model_info(user_model)
+                if not await check_model_access(message, model_info, user_id):
+                    return
+        
         # Build message payload
         payload_messages = [user_system_message]
         if _memory_store:
@@ -927,7 +1133,7 @@ async def process_ai_request(request):
         )
 
         # Stream or regular response
-        if "live-preview" in user_model:
+        if is_live:
             collected_response = ""
             last_update = 0
             

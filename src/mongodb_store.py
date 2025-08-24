@@ -32,7 +32,8 @@ class MongoDBStore:
             'user_config': 'user_configs',
             'memory': 'user_memory', 
             'authorized': 'authorized_users',
-            'models': 'supported_models'
+            'models': 'supported_models',
+            'pmodels': 'profile_models'  # New collection for profile models
         }
         
         self._connect()
@@ -82,6 +83,9 @@ class MongoDBStore:
             
             # Supported models indexes
             self.db[self.COLLECTIONS['models']].create_index("model_name", unique=True)
+            
+            # Profile models indexes
+            self.db[self.COLLECTIONS['pmodels']].create_index("name", unique=True)
             
             logger.info("MongoDB indexes created successfully")
         except Exception as e:
@@ -379,10 +383,17 @@ class MongoDBStore:
             return {"gemini-2.5-flash", "gemini-2.5-pro", "gpt-3.5-turbo", "gpt-5"}
     
     def model_exists(self, model_name: str) -> bool:
-        """Check if a model exists in supported models"""
+        """Check if a model exists in supported models or profile models"""
         try:
-            result = self.db[self.COLLECTIONS['models']].find_one({"model_name": model_name})
-            return result is not None
+            # Check regular models
+            model = self.db[self.COLLECTIONS['models']].find_one({"model_name": model_name})
+            if model:
+                return True
+            
+            # Check profile models
+            pmodel = self.db[self.COLLECTIONS['pmodels']].find_one({"name": model_name})
+            return pmodel is not None
+        
         except Exception as e:
             logger.exception(f"Error checking if model {model_name} exists: {e}")
             return False
@@ -623,6 +634,138 @@ class MongoDBStore:
         if self.client:
             self.client.close()
             logger.info("MongoDB connection closed")
+
+    # =====================================
+    # PROFILE MODEL METHODS
+    # =====================================
+    
+    def add_profile_model(self, name: str) -> tuple[bool, str]:
+        """Add a new profile model with default values"""
+        try:
+            name = name.strip()
+            if not name:
+                return False, "Profile model name cannot be empty"
+            
+            # Check if profile already exists
+            existing = self.db[self.COLLECTIONS['pmodels']].find_one({"name": name})
+            if existing:
+                return False, f"Profile model '{name}' already exists"
+            
+            # Create profile with default values
+            profile = {
+                "name": name,
+                "base_model": None,
+                "sys_prompt": None,
+                "credit_cost": 0,
+                "access_level": 0,
+                "is_live": False,
+                "created_at": datetime.utcnow()
+            }
+            
+            result = self.db[self.COLLECTIONS['pmodels']].insert_one(profile)
+            
+            if result.inserted_id:
+                return True, f"Successfully created profile model '{name}'. Use ;edit pmodel to configure settings."
+            return False, "Failed to create profile model"
+            
+        except Exception as e:
+            logger.exception(f"Error adding profile model {name}: {e}")
+            return False, f"Database error: {e}"
+
+    def get_profile_model_details(self, name: str) -> tuple[bool, str]:
+        """Get detailed info about a profile model"""
+        try:
+            profile = self.db[self.COLLECTIONS['pmodels']].find_one({"name": name})
+            if not profile:
+                return False, f"Profile model '{name}' does not exist"
+
+            # Format details
+            details = [
+                f"**Profile Model: `{name}`**",
+                f"Base Model: `{profile.get('base_model') or 'Not set'}`",
+                f"Cost: {profile.get('credit_cost', 0)} credits",
+                f"Level: {profile.get('access_level', 0)}",
+                f"Live: {'✅' if profile.get('is_live') else '❌'}"
+            ]
+            
+            # Add system prompt at the end
+            sys_prompt = profile.get('sys_prompt')
+            if sys_prompt:
+                details.append("\n**System Prompt:**")
+                details.append(f"`{sys_prompt}`")
+            
+            return True, "\n".join(details)
+        except Exception as e:
+            logger.exception(f"Error getting profile model details {name}: {e}")
+            return False, f"Error: {e}"
+    
+    def edit_profile_model(self, name: str, field: str, value: Any) -> tuple[bool, str]:
+        """Edit a profile model field"""
+        try:
+            name = name.strip()
+            if not name:
+                return False, "Profile model name cannot be empty"
+            
+            # Get existing profile
+            profile = self.db[self.COLLECTIONS['pmodels']].find_one({"name": name})
+            if not profile:
+                return False, f"Profile model '{name}' does not exist"
+            
+            # Validate field
+            valid_fields = ["base_model", "sys_prompt", "credit_cost", "access_level", "is_live"]
+            if field not in valid_fields:
+                return False, f"Invalid field '{field}'. Valid fields: {', '.join(valid_fields)}"
+            
+            # Validate and convert value based on field
+            if field == "base_model":
+                # Remove model existence check - allow any model name
+                pass
+            elif field in ["credit_cost", "access_level"]:
+                try:
+                    value = int(value)
+                    if field == "access_level" and value not in [0, 1, 2, 3]:
+                        return False, "Access level must be 0, 1, 2, or 3"
+                    if field == "credit_cost" and value < 0:
+                        return False, "Credit cost cannot be negative"
+                except ValueError:
+                    return False, f"{field} must be an integer"
+            elif field == "is_live":
+                value = str(value).lower() in ['true', '1', 'yes']
+            
+            # Update field
+            result = self.db[self.COLLECTIONS['pmodels']].update_one(
+                {"name": name},
+                {
+                    "$set": {
+                        field: value,
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+            
+            if result.modified_count > 0:
+                return True, f"Successfully updated {field} for profile model '{name}'"
+            return False, "No changes were made"
+            
+        except Exception as e:
+            logger.exception(f"Error editing profile model {name}: {e}")
+            return False, f"Database error: {e}"
+            
+    def get_profile_model(self, name: str) -> Optional[Dict[str, Any]]:
+        """Get profile model details"""
+        try:
+            return self.db[self.COLLECTIONS['pmodels']].find_one({"name": name})
+        except Exception as e:
+            logger.exception(f"Error getting profile model {name}: {e}")
+            return None
+            
+    def list_profile_models(self) -> List[Dict[str, Any]]:
+        """List all profile models"""
+        try:
+            return list(self.db[self.COLLECTIONS['pmodels']].find().sort("name", 1))
+        except Exception as e:
+            logger.exception("Error listing profile models")
+            return []
 
 # Singleton instance
 _mongodb_store: Optional[MongoDBStore] = None

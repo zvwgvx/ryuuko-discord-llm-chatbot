@@ -1,10 +1,11 @@
 import logging
 import os
-import asyncio  # Add this import
+import asyncio
 from typing import List, Dict, Any, Tuple, Optional, AsyncIterator
 from openai import OpenAI
 import google.generativeai as genai
 import load_config
+from mongodb_store import get_mongodb_store
 
 logger = logging.getLogger("discord-openai-proxy.call_api")
 
@@ -232,7 +233,7 @@ def call_gemini_api(
     """
     try:
         # Configure API key
-        if is_owner and clients.owner_gemini_available and hasattr(load_config, 'OWNER_GEMINI_API_KEY'):
+        if is_owner and clients.owner_gemini_available:
             genai.configure(api_key=load_config.OWNER_GEMINI_API_KEY)
             logger.debug("Using owner's Gemini API key")
         elif clients.gemini_available:
@@ -241,6 +242,10 @@ def call_gemini_api(
         else:
             return False, clients.gemini_error or "Gemini API not initialized"
 
+        # Clean model name - remove preview/audio suffixes for actual API call
+        cleaned_model = model.replace("-preview-native-audio-dialog", "")
+        cleaned_model = cleaned_model.replace("-live-preview", "")
+        
         # Create generation config
         generation_config = create_generation_config(
             temperature=temperature,
@@ -250,10 +255,11 @@ def call_gemini_api(
         )
         
         logger.debug(f"Gemini generation config: {generation_config}")
+        logger.debug(f"Using model: {cleaned_model} (original: {model})")
         
         # Create model instance
         model_instance = genai.GenerativeModel(
-            model,
+            cleaned_model,  # Use cleaned model name
             safety_settings=GeminiConfig.DEFAULT_SAFETY_SETTINGS,
             generation_config=generation_config
         )
@@ -310,11 +316,23 @@ async def call_gemini_api_stream(messages: List[Dict[str, str]], model: str, is_
 
 def is_model_available(model: str) -> Tuple[bool, str]:
     """Check if a model is available for use"""
-    if is_gemini_model(model):
-        if not clients.gemini_available:
-            return False, clients.gemini_error or "Gemini API is not available"
+    try:
+        # Get MongoDB store instance
+        _mongodb_store = get_mongodb_store()
+        
+        # Check profile model first
+        if _mongodb_store and _mongodb_store.get_profile_model(model):
+            return True, ""
+
+        if is_gemini_model(model):
+            if not clients.gemini_available:
+                return False, clients.gemini_error or "Gemini API is not available"
+            return True, ""
         return True, ""
-    return True, ""  # Non-Gemini models are assumed available
+        
+    except Exception as e:
+        logger.error(f"Error checking model availability: {e}")
+        return False, str(e)
 
 def call_openai_proxy(
     messages: List[Dict[str, str]], 
