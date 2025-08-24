@@ -97,6 +97,7 @@ class MongoDBStore:
                     {"model_name": "gemini-2.5-pro", "created_at": datetime.utcnow(), "is_default": True, "credit_cost": 50, "access_level": 0},
                     {"model_name": "gpt-3.5-turbo", "created_at": datetime.utcnow(), "is_default": True, "credit_cost": 200, "access_level": 0},
                     {"model_name": "gpt-5", "created_at": datetime.utcnow(), "is_default": True, "credit_cost": 700, "access_level": 1},
+
                 ]
                 
                 self.db[self.COLLECTIONS['models']].insert_many(default_models)
@@ -414,8 +415,8 @@ class MongoDBStore:
             if credit_cost < 0:
                 return False, "Credit cost cannot be negative"
                 
-            if access_level not in [0, 1, 2]:
-                return False, "Access level must be 0, 1, or 2"
+            if access_level not in [0, 1, 2, 3]:
+                return False, "Access level must be 0, 1, 2, or 3"
                 
             existing = self.db[self.COLLECTIONS['models']].find_one({"model_name": model_name})
             if existing:
@@ -483,8 +484,8 @@ class MongoDBStore:
                 update_data["credit_cost"] = credit_cost
                 
             if access_level is not None:
-                if access_level not in [0, 1, 2]:
-                    return False, "Access level must be 0, 1, or 2"
+                if access_level not in [0, 1, 2, 3]:
+                    return False, "Access level must be 0, 1, 2, or 3"
                 update_data["access_level"] = access_level
                 
             result = self.db[self.COLLECTIONS['models']].update_one(
@@ -556,7 +557,7 @@ class MongoDBStore:
     def set_user_level(self, user_id: int, level: int) -> bool:
         """Set user access level"""
         try:
-            if level not in [0, 1, 2]:
+            if level not in [0, 1, 2, 3]:
                 return False
                 
             result = self.db[self.COLLECTIONS['user_config']].update_one(

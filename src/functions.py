@@ -233,6 +233,7 @@ async def help_cmd(ctx: commands.Context):
         "`;set model <model>` – Set your preferred AI model.",
         "`;set sys_prompt <prompt>` – Set your system prompt.", 
         "`;show profile` – Show your current configuration.",
+        "`;show sys_prompt [@user]` - View system prompt.",
         "`;show model` – Show all supported models."
     ]
 
@@ -249,7 +250,7 @@ async def help_cmd(ctx: commands.Context):
             "**Model management (owner only):**",
             "`;add model <model_name> <credit_cost> <access_level>` – Add a new model",
             "  - credit_cost: Cost in credits per use",
-            "  - access_level: Required user level (0=Basic, 1=Advanced, 2=Premium)",
+            "  - access_level: Required user level (0=Basic, 1=Advanced, 2=Premium, 3=Ultimate)",
             "`;remove model <model_name>` – Remove a model",
         ]
 
@@ -390,8 +391,8 @@ async def add_cmd(ctx: commands.Context, resource_type: str = None, *, value: st
             if credit_cost < 0:
                 raise ValueError("Credit cost must be positive")
                 
-            if access_level not in [0, 1, 2]:
-                raise ValueError("Access level must be 0, 1, or 2")
+            if access_level not in [0, 1, 2, 3]:
+                raise ValueError("Access level must be 0, 1, 2, or 3")
                 
         except ValueError as e:
             await ctx.send(f"Error: {str(e)}", allowed_mentions=discord.AllowedMentions.none())
@@ -536,8 +537,8 @@ async def edit_cmd(ctx: commands.Context, resource_type: str = None, *, value: s
             if credit_cost < 0:
                 raise ValueError("Credit cost must be positive")
                 
-            if access_level not in [0, 1, 2]:
-                raise ValueError("Access level must be 0, 1, or 2")
+            if access_level not in [0, 1, 2, 3]:
+                raise ValueError("Access level must be 0, 1, 2, or 3")
                 
         except ValueError as e:
             await ctx.send(f"Error: {str(e)}", allowed_mentions=discord.AllowedMentions.none())
@@ -614,7 +615,7 @@ async def set_cmd(ctx: commands.Context, attribute: str = None, *, value: str = 
             return
             
         if not value:
-            await ctx.send("Usage: `;set level @user <level>` (0=Basic, 1=Advanced, 2=Premium)", 
+            await ctx.send("Usage: `;set level @user <level>` (0=Basic, 1=Advanced, 2=Premium, 3=Ultimate)", 
                           allowed_mentions=discord.AllowedMentions.none())
             return
             
@@ -628,8 +629,8 @@ async def set_cmd(ctx: commands.Context, attribute: str = None, *, value: str = 
             target_user = await commands.MemberConverter().convert(ctx, args[0])
             level = int(args[1])
             
-            if level not in [0, 1, 2]:
-                raise ValueError("Level must be 0, 1, or 2")
+            if level not in [0, 1, 2, 3]:
+                raise ValueError("Level must be 0, 1, 2, or 3")
                 
         except (ValueError, commands.MemberNotFound) as e:
             await ctx.send(f"Error: {str(e)}", allowed_mentions=discord.AllowedMentions.none())
@@ -638,7 +639,7 @@ async def set_cmd(ctx: commands.Context, attribute: str = None, *, value: str = 
         if _use_mongodb_auth:
             success = _mongodb_store.set_user_level(target_user.id, level)
             if success:
-                level_names = {0: "Basic", 1: "Advanced", 2: "Premium"}
+                level_names = {0: "Basic", 1: "Advanced", 2: "Premium", 3: "Ultimate"}
                 await ctx.send(f"Set {target_user}'s level to {level_names[level]} (Level {level})", 
                               allowed_mentions=discord.AllowedMentions.none())
             else:
@@ -656,9 +657,9 @@ async def set_cmd(ctx: commands.Context, attribute: str = None, *, value: str = 
 # Show command dispatcher (updated)
 # ------------------------------------------------------------------
 async def show_cmd(ctx: commands.Context, item: str = None, detail_or_user: str = None):
-    """Show command dispatcher - handles: show profile, show profile @user (owner), show model, show models detailed, show auth"""
+    """Show command dispatcher - handles: show profile, show sys_prompt, show profile @user (owner), show model"""
     if item is None:
-        await ctx.send("Usage: `;show profile`, `;show profile @user` (owner), `;show model`, `;show models detailed` (owner), or `;show auth` (owner)", 
+        await ctx.send("Usage: `;show profile`, `;show sys_prompt [@user]`, `;show model`", 
                       allowed_mentions=discord.AllowedMentions.none())
         return
     
@@ -712,30 +713,66 @@ async def show_cmd(ctx: commands.Context, item: str = None, detail_or_user: str 
         model = user_config["model"]
         credit = user_config.get("credit", 0)
         access_level = user_config.get("access_level", 0)
-        prompt = user_config["system_prompt"]
 
         # Level description
         level_desc = {
             0: "Basic (Level 0)",
             1: "Advanced (Level 1)", 
-            2: "Premium (Level 2)"
+            2: "Premium (Level 2)",
+            3: "Ultimate (Level 3)"
         }.get(access_level, f"Unknown (Level {access_level})")
 
-        # Format display prompts
-        display_prompt = prompt[:500] + "...[truncated]" if len(prompt) > 700 else prompt
-
-        # Build profile display
+        # Build profile display without system prompt
         lines = [
             f"**👤 Profile for {target_user}:**",
             f"🤖 **Current Model**: {model}",
             f"💰 **Credit Balance**: {credit}",
             f"🔑 **Access Level**: {level_desc}",
-            "📝 **System Prompt:**",
-            "```",
-            display_prompt,
-            "```"
+            "",
+            "Use `;show sys_prompt` to view system prompt."
         ]
 
+        await ctx.send("\n".join(lines), allowed_mentions=discord.AllowedMentions.none())
+        return
+
+    elif item == "sys_prompt":
+        # Handle system prompt display
+        target_user: Optional[discord.Member] = None
+        if detail_or_user:
+            try:
+                target_user = await commands.MemberConverter().convert(ctx, detail_or_user)
+            except Exception:
+                await ctx.send("Could not find specified user.", allowed_mentions=discord.AllowedMentions.none())
+                return
+            
+            # Check if viewer is owner when viewing other's prompt
+            if target_user != ctx.author:
+                try:
+                    is_owner = await _bot.is_owner(ctx.author)
+                except Exception:
+                    is_owner = False
+
+                if not is_owner:
+                    await ctx.send("Only the bot owner can view other users' system prompts.",
+                                 allowed_mentions=discord.AllowedMentions.none())
+                    return
+        else:
+            target_user = ctx.author
+            
+        # Get system prompt
+        user_config = _user_config_manager.get_user_config(target_user.id)
+        prompt = user_config["system_prompt"]
+        
+        # Format display
+        lines = [
+            f"**📝 System Prompt for {target_user}:**",
+            "```",
+            prompt,
+            "```",
+            "",
+            "This is the prompt used to guide the AI's responses."
+        ]
+        
         await ctx.send("\n".join(lines), allowed_mentions=discord.AllowedMentions.none())
         return
 
@@ -757,7 +794,7 @@ async def show_cmd(ctx: commands.Context, item: str = None, detail_or_user: str 
                     model_name = model.get("model_name", "Unknown")
                     credit_cost = model.get("credit_cost", 0)
                     access_level = model.get("access_level", 0)
-                    level_names = {0: "Basic", 1: "Advanced", 2: "Premium"}
+                    level_names = {0: "Basic", 1: "Advanced", 2: "Premium", 3: "Ultimate"}
                     level_name = level_names.get(access_level, f"Level {access_level}")
                     
                     # Add level header if level changed
