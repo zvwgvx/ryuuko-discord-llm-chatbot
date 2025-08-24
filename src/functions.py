@@ -1050,10 +1050,10 @@ async def show_cmd(ctx: commands.Context, item: str = None, detail_or_user: str 
         if all_profiles:
             lines = ["**Profile Models:**"]
             for p in all_profiles:
-                name = p.get(" - name", "Unknown")
-                base = p.get(" - base_model", "Unknown")
-                cost = p.get(" - credit_cost", 0)
-                level = p.get(" - access_level", 0)
+                name = p.get("name", "Unknown")
+                base = p.get("base_model", "Unknown")
+                cost = p.get("credit_cost", 0)
+                level = p.get("access_level", 0)
                 is_live = "✅" if p.get("is_live") else "❌"
                 lines.append(f"• `{name}` -> {base} (Cost: {cost}, Level: {level}, Live: {is_live})")
         else:
