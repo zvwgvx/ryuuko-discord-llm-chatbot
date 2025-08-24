@@ -7,6 +7,14 @@ import google.generativeai as genai
 import load_config
 from mongodb_store import get_mongodb_store
 
+# Add Live API imports
+try:
+    from google import genai as live_genai
+    from google.genai import types
+    LIVE_API_AVAILABLE = True
+except ImportError:
+    LIVE_API_AVAILABLE = False
+
 logger = logging.getLogger("discord-openai-proxy.call_api")
 
 class APIClients:
@@ -31,6 +39,12 @@ class APIClients:
         self.owner_gemini_available = False
         self.gemini_error = None
         self._init_gemini_clients()
+        
+        # Initialize Live API client
+        self.live_client = None
+        self.live_available = False
+        self.live_error = None
+        self._init_live_client()
         
         self._initialized = True
     
@@ -68,6 +82,36 @@ class APIClients:
         except Exception as e:
             self.gemini_error = f"Error initializing Gemini clients: {e}"
             logger.error(self.gemini_error)
+    
+    def _init_live_client(self) -> None:
+        """Initialize Gemini Live API client"""
+        try:
+            if not LIVE_API_AVAILABLE:
+                self.live_error = "Google GenAI SDK not installed. Run: pip install google-genai"
+                logger.error(self.live_error)
+                return
+            
+            # Use same API key as regular Gemini
+            api_key = None
+            if hasattr(load_config, 'CLIENT_GEMINI_API_KEY') and load_config.CLIENT_GEMINI_API_KEY:
+                api_key = load_config.CLIENT_GEMINI_API_KEY
+            elif hasattr(load_config, 'OWNER_GEMINI_API_KEY') and load_config.OWNER_GEMINI_API_KEY:
+                api_key = load_config.OWNER_GEMINI_API_KEY
+            
+            if api_key:
+                self.live_client = live_genai.Client(
+                    http_options={"api_version": "v1beta"},
+                    api_key=api_key,
+                )
+                self.live_available = True
+                logger.info("Gemini Live API client initialized")
+            else:
+                self.live_error = "No API key found for Live API"
+                logger.warning(self.live_error)
+                
+        except Exception as e:
+            self.live_error = f"Error initializing Live API client: {e}"
+            logger.error(self.live_error)
 
 # Global instance
 clients = APIClients()
@@ -96,6 +140,18 @@ class GeminiConfig:
         5: "OTHER"
     }
 
+def is_gemini_live_model(model_name: str) -> bool:
+    """Check if the model requires Live API"""
+    live_model_patterns = [
+        "gemini-2.5-flash-live-preview",
+        "gemini-2.5-flash-preview-native-audio-dialog",
+        "gemini-2.5-flash-exp-native-audio-thinking-dialog",
+        "live-preview"
+    ]
+    
+    model_lower = model_name.lower()
+    return any(pattern in model_lower for pattern in live_model_patterns)
+
 def is_gemini_model(model_name: str) -> bool:
     """Check if the model is a Gemini model"""
     return (model_name.startswith("gemini-") or 
@@ -114,7 +170,8 @@ def build_gemini_prompt(messages: List[Dict[str, str]]) -> str:
         role = msg.get("role", "")
         content = msg.get("content", "")
         
-        if not content.strip():
+        # Fix: Check if content is None or empty string
+        if content is None or not content.strip():
             continue
             
         if role == "system":
@@ -210,6 +267,115 @@ def extract_gemini_response(response) -> Tuple[bool, str]:
         logger.exception(f"Error extracting response text: {e}")
         return False, f"Error processing Gemini response: {str(e)}"
 
+def call_gemini_live_api_sync(
+    messages: List[Dict[str, str]], 
+    model: str,
+    is_owner: bool = False
+) -> Tuple[bool, str]:
+    """Synchronous wrapper for Live API"""
+    try:
+        return asyncio.run(call_gemini_live_api_async(messages, model, is_owner))
+    except Exception as e:
+        logger.exception(f"Error in Live API sync wrapper: {e}")
+        return False, f"Live API error: {str(e)}"
+
+async def call_gemini_live_api_async(
+    messages: List[Dict[str, str]], 
+    model: str,
+    is_owner: bool = False
+) -> Tuple[bool, str]:
+    """Call Gemini Live API"""
+    
+    if not clients.live_available:
+        return False, clients.live_error or "Gemini Live API not available"
+    
+    try:
+        # Create simple config for text-only response
+        config = types.LiveConnectConfig(
+            response_modalities=["TEXT"],
+            media_resolution="MEDIA_RESOLUTION_LOW",
+        )
+        
+        # Convert messages to simple prompt
+        prompt = build_gemini_prompt(messages)
+        logger.debug(f"Live API prompt length: {len(prompt)} characters")
+        
+        # Map model names to correct Live API model names
+        model_mapping = {
+            "gemini-2.5-flash-live-preview": "models/gemini-2.5-flash-live-preview",
+            "gemini-2.5-flash-preview-native-audio-dialog": "models/gemini-2.5-flash-preview-native-audio-dialog",
+            "gemini-2.5-flash-exp-native-audio-thinking-dialog": "models/gemini-2.5-flash-exp-native-audio-thinking-dialog"
+        }
+        
+        live_model = model_mapping.get(model, "models/gemini-2.5-flash-live-preview")
+        logger.debug(f"Using Live API model: {live_model}")
+        
+        # Connect and get response
+        response_text = ""
+        async with clients.live_client.aio.live.connect(model=live_model, config=config) as session:
+            # Send the prompt
+            await session.send(input=prompt, end_of_turn=True)
+            
+            # Receive response
+            turn = session.receive()
+            async for response in turn:
+                if text := response.text:
+                    response_text += text
+        
+        if response_text.strip():
+            return True, response_text.strip()
+        else:
+            return False, "No response from Live API"
+            
+    except Exception as e:
+        logger.exception(f"Error calling Live API: {e}")
+        return False, f"Live API error: {str(e)}"
+
+async def call_gemini_live_api_stream_async(
+    messages: List[Dict[str, str]], 
+    model: str,
+    is_owner: bool = False
+) -> AsyncIterator[str]:
+    """Stream response from Gemini Live API"""
+    
+    if not clients.live_available:
+        yield clients.live_error or "Gemini Live API not available"
+        return
+    
+    try:
+        # Create simple config for text-only response
+        config = types.LiveConnectConfig(
+            response_modalities=["TEXT"],
+            media_resolution="MEDIA_RESOLUTION_LOW",
+        )
+        
+        # Convert messages to simple prompt
+        prompt = build_gemini_prompt(messages)
+        
+        # Map model names to correct Live API model names
+        model_mapping = {
+            "gemini-2.5-flash-live-preview": "models/gemini-2.5-flash-live-preview",
+            "gemini-2.5-flash-preview-native-audio-dialog": "models/gemini-2.5-flash-live-preview",
+            "gemini-2.5-flash-exp-native-audio-thinking-dialog": "models/gemini-2.5-flash-live-preview"
+        }
+        
+        live_model = model_mapping.get(model, "models/gemini-2.5-flash-live-preview")
+        
+        # Connect and stream response
+        async with clients.live_client.aio.live.connect(model=live_model, config=config) as session:
+            # Send the prompt
+            await session.send(input=prompt, end_of_turn=True)
+            
+            # Stream response
+            turn = session.receive()
+            async for response in turn:
+                if text := response.text:
+                    yield text
+                    
+    except Exception as e:
+        logger.exception(f"Error in Live API stream: {e}")
+        yield f"Live API stream error: {str(e)}"
+
 def call_gemini_api(
     messages: List[Dict[str, str]], 
     model: str, 
@@ -219,18 +385,13 @@ def call_gemini_api(
     top_k: Optional[int] = None,
     max_output_tokens: Optional[int] = None
 ) -> Tuple[bool, str]:
-    """
-    Call Gemini API with enhanced parameter support
+    """Call Gemini API with enhanced parameter support and Live API support"""
     
-    Args:
-        messages: List of message dictionaries
-        model: Model name (e.g., 'gemini-pro')
-        is_owner: Whether to use owner API key
-        temperature: Controls randomness (0.0-2.0)
-        top_p: Controls nucleus sampling (0.0-1.0) 
-        top_k: Controls top-k sampling (1-100)
-        max_output_tokens: Maximum tokens in response (1-32768)
-    """
+    # Check if this is a Live API model
+    if is_gemini_live_model(model):
+        return call_gemini_live_api_sync(messages, model, is_owner)
+    
+    # Regular Gemini API (unchanged)
     try:
         # Configure API key
         if is_owner and clients.owner_gemini_available:
@@ -242,10 +403,6 @@ def call_gemini_api(
         else:
             return False, clients.gemini_error or "Gemini API not initialized"
 
-        # Clean model name - remove preview/audio suffixes for actual API call
-        cleaned_model = model.replace("-preview-native-audio-dialog", "")
-        cleaned_model = cleaned_model.replace("-live-preview", "")
-        
         # Create generation config
         generation_config = create_generation_config(
             temperature=temperature,
@@ -255,11 +412,10 @@ def call_gemini_api(
         )
         
         logger.debug(f"Gemini generation config: {generation_config}")
-        logger.debug(f"Using model: {cleaned_model} (original: {model})")
         
-        # Create model instance
+        # Create model instance with original model name
         model_instance = genai.GenerativeModel(
-            cleaned_model,  # Use cleaned model name
+            model,
             safety_settings=GeminiConfig.DEFAULT_SAFETY_SETTINGS,
             generation_config=generation_config
         )
@@ -281,7 +437,15 @@ def call_gemini_api(
         return False, f"Gemini API error: {str(e)}"
 
 async def call_gemini_api_stream(messages: List[Dict[str, str]], model: str, is_owner: bool = False) -> AsyncIterator[str]:
-    """Stream response from Gemini API"""
+    """Stream response from Gemini API with Live API support"""
+    
+    # Check if this is a Live API model
+    if is_gemini_live_model(model):
+        async for chunk in call_gemini_live_api_stream_async(messages, model, is_owner):
+            yield chunk
+        return
+    
+    # Regular Gemini API streaming (unchanged)
     try:
         # Configure API key
         if is_owner and clients.owner_gemini_available:
@@ -292,9 +456,9 @@ async def call_gemini_api_stream(messages: List[Dict[str, str]], model: str, is_
             yield "Gemini API not initialized"
             return
 
-        # Create model instance with streaming
+        # Create model instance with streaming using original model name
         model_instance = genai.GenerativeModel(
-            model_name=model.replace("-live-preview", ""),
+            model_name=model,
             safety_settings=GeminiConfig.DEFAULT_SAFETY_SETTINGS
         )
 
@@ -325,6 +489,13 @@ def is_model_available(model: str) -> Tuple[bool, str]:
             return True, ""
 
         if is_gemini_model(model):
+            # Check Live API models
+            if is_gemini_live_model(model):
+                if not clients.live_available:
+                    return False, clients.live_error or "Gemini Live API is not available"
+                return True, ""
+            
+            # Regular Gemini models
             if not clients.gemini_available:
                 return False, clients.gemini_error or "Gemini API is not available"
             return True, ""
@@ -408,12 +579,16 @@ async def call_openai_proxy_stream(
         yield error
         return
         
-    if "live-preview" in model:
-        # Use Gemini streaming
+    if is_gemini_live_model(model):
+        # Use Live API streaming
+        async for chunk in call_gemini_live_api_stream_async(messages, model, is_owner):
+            yield chunk
+    elif is_gemini_model(model):
+        # Use regular Gemini streaming
         async for chunk in call_gemini_api_stream(messages, model, is_owner):
             yield chunk
     else:
-        # Regular non-streaming call
+        # Regular non-streaming call for OpenAI
         ok, response = call_openai_proxy(messages, model, is_owner)
         if ok:
             yield response
