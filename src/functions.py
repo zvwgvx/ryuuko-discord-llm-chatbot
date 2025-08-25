@@ -14,6 +14,7 @@ import asyncio
 import time
 from pathlib import Path
 from typing import Set, Optional, List, Dict
+from datetime import datetime, timezone, timedelta
 
 import discord
 from discord.ext import commands
@@ -1084,6 +1085,14 @@ async def deduct_credits(user_id: int, amount: int) -> bool:
         logger.info(f"Deducted {amount} credits from user {user_id}. Remaining: {remaining}")
     return success
 
+def get_vietnam_timestamp() -> str:
+    """Get current timestamp in GMT+7 (Vietnam timezone)"""
+    vietnam_tz = timezone(timedelta(hours=7))
+    now = datetime.now(vietnam_tz)
+    
+    formatted_time = now.strftime("%A, %B %d, %Y - %H:%M:%S")
+    return f"Thời gian hiện tại: {formatted_time} (GMT+7) : "
+    
 async def process_ai_request(request):
     """Process a single AI request from the queue with stream support"""
     message = request.message
@@ -1123,6 +1132,8 @@ async def process_ai_request(request):
         payload_messages = [user_system_message]
         if _memory_store:
             payload_messages.extend(_memory_store.get_user_messages(user_id))
+            
+            final_user_text = f"{get_vietnam_timestamp()}{final_user_text}"
         payload_messages.append({"role": "user", "content": final_user_text})
 
         # Create initial response message
@@ -1632,10 +1643,6 @@ async def on_message(message: discord.Message):
     
     except Exception as e:
         logger.exception("Error adding request to queue")
-        await message.channel.send(
-            f"❌ Error adding request to queue: {e}",
-            allowed_mentions=discord.AllowedMentions.none()
-        )
 
 # ------------------------------------------------------------------
 # Setup – register commands, listeners, load data (updated for MongoDB)

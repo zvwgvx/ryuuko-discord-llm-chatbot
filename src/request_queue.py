@@ -84,7 +84,7 @@ class RequestQueue:
         
         # Check if user already has a request being processed
         if user_id in self._processing_users:
-            return False, "⏳ You have a request being processed. Please wait for it to complete."
+            return False
         
         # Check if user already has requests in queue - IMPROVED CHECK
         user_has_queued_request = False
