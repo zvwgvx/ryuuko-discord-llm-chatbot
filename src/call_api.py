@@ -140,6 +140,23 @@ class GeminiConfig:
         5: "OTHER"
     }
 
+def get_live_api_tools():
+    """Create and return Live API tools configuration"""
+    try:
+        if not LIVE_API_AVAILABLE:
+            logger.warning("Live API not available, returning empty tools list")
+            return []
+            
+        tools = [
+            types.Tool(url_context=types.UrlContext()),
+            types.Tool(google_search=types.GoogleSearch()),
+        ]
+        logger.debug("Live API tools configured: URL Context and Google Search")
+        return tools
+    except Exception as e:
+        logger.error(f"Error creating Live API tools: {e}")
+        return []
+
 def is_gemini_live_model(model_name: str) -> bool:
     """Check if the model requires Live API"""
     live_model_patterns = [
@@ -284,21 +301,26 @@ async def call_gemini_live_api_async(
     model: str,
     is_owner: bool = False
 ) -> Tuple[bool, str]:
-    """Call Gemini Live API"""
+    """Call Gemini Live API with tools support"""
     
     if not clients.live_available:
         return False, clients.live_error or "Gemini Live API not available"
     
     try:
-        # Create simple config for text-only response
+        # Get Live API tools
+        tools = get_live_api_tools()
+        
+        # Create config with tools enabled
         config = types.LiveConnectConfig(
             response_modalities=["TEXT"],
             media_resolution="MEDIA_RESOLUTION_LOW",
+            tools=tools if tools else None,  # Only include tools if they exist
         )
         
         # Convert messages to simple prompt
         prompt = build_gemini_prompt(messages)
         logger.debug(f"Live API prompt length: {len(prompt)} characters")
+        logger.debug(f"Live API tools enabled: {len(tools) if tools else 0}")
         
         # Map model names to correct Live API model names
         model_mapping = {
@@ -336,21 +358,27 @@ async def call_gemini_live_api_stream_async(
     model: str,
     is_owner: bool = False
 ) -> AsyncIterator[str]:
-    """Stream response from Gemini Live API"""
+    """Stream response from Gemini Live API with tools support"""
     
     if not clients.live_available:
         yield clients.live_error or "Gemini Live API not available"
         return
     
     try:
-        # Create simple config for text-only response
+        # Get Live API tools
+        tools = get_live_api_tools()
+        
+        # Create config with tools enabled
         config = types.LiveConnectConfig(
             response_modalities=["TEXT"],
             media_resolution="MEDIA_RESOLUTION_LOW",
+            tools=tools if tools else None,  # Only include tools if they exist
         )
         
         # Convert messages to simple prompt
         prompt = build_gemini_prompt(messages)
+        logger.debug(f"Live API stream prompt length: {len(prompt)} characters")
+        logger.debug(f"Live API stream tools enabled: {len(tools) if tools else 0}")
         
         # Map model names to correct Live API model names
         model_mapping = {

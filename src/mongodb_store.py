@@ -766,6 +766,27 @@ class MongoDBStore:
         except Exception as e:
             logger.exception("Error listing profile models")
             return []
+    
+    def delete_profile_model(self, name: str) -> bool:
+        """Delete a profile model"""
+        try:
+            result = self.db[self.COLLECTIONS['pmodels']].delete_one({"name": name})
+            return result.deleted_count > 0
+        except Exception as e:
+            logger.exception(f"Error deleting profile model {name}: {e}")
+            return False
+        
+    def get_users_using_model(self, model_name: str) -> List[int]:
+        """Get list of user IDs currently using a specific model"""
+        try:
+            results = self.db[self.COLLECTIONS['user_config']].find(
+                {"model": model_name},
+                {"user_id": 1}
+            )
+            return [doc["user_id"] for doc in results]
+        except Exception as e:
+            logger.exception(f"Error getting users for model {model_name}: {e}")
+            return []
 
 # Singleton instance
 _mongodb_store: Optional[MongoDBStore] = None
