@@ -1,6 +1,6 @@
 # Ryuuko — Discord LLM Bot
 
-Version: v5.0
+Version: v5.2.0-lr0
 
 Ryuuko is a Discord bot written in Python that uses a Large Language Model (LLM) — for example OpenAI / Gemini / a compatible endpoint — to answer messages, handle commands, and optionally store user "memory" / configuration in MongoDB.
 
