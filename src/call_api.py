@@ -15,7 +15,7 @@ try:
 except ImportError:
     LIVE_API_AVAILABLE = False
 
-logger = logging.getLogger("discord-openai-proxy.call_api")
+logger = logging.getLogger("call_api")
 
 class APIClients:
     """Singleton class to manage API clients"""

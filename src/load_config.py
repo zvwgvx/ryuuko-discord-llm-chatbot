@@ -10,7 +10,7 @@ from mongodb_store import init_mongodb_store, get_mongodb_store
 # --------------------------------------------------------------------
 # Logger
 # --------------------------------------------------------------------
-logger = logging.getLogger("discord-openai-proxy.config")
+logger = logging.getLogger("config")
 if not logger.handlers:
     hdlr = logging.StreamHandler()
     fmt = "%(asctime)s %(name)s %(levelname)s: %(message)s"

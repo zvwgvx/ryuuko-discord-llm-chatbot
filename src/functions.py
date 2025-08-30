@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # coding: utf-8
-# ────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Bot helper / command registry - UPDATED FOR SLASH COMMANDS
 # Uses MemoryStore for per‑user conversation history
 # Uses UserConfigManager for per-user model and system prompt settings
 # Uses MongoDB for model management
-# ────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 import re
 import json
@@ -20,13 +20,13 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
-# ────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # ***Absolute import — no package, so we use the plain module name ***
 from memory_store import MemoryStore
 from user_config import get_user_config_manager
 from request_queue import get_request_queue
 
-logger = logging.getLogger("discord-openai-proxy.functions")
+logger = logging.getLogger("functions")
 
 # ---------------------------- module‑level state -----------------------------
 _bot: Optional[commands.Bot] = None
@@ -120,7 +120,7 @@ def remove_authorized_user(user_id: int) -> bool:
             save_authorized_to_path(_config.AUTHORIZED_STORE, _authorized_users)
             return True
         return False
-    
+
 # ------------------------------------------------------------------
 # Utility helpers
 # ------------------------------------------------------------------
@@ -216,6 +216,636 @@ async def _read_attachments_as_text(attachments: List[discord.Attachment]) -> Li
     return result
 
 # ------------------------------------------------------------------
+# Message formatting helpers with enhanced long message handling
+# ------------------------------------------------------------------
+
+def convert_latex_to_discord(text: str) -> str:
+    """Fixed version - only protect code blocks, NOT markdown tables"""
+    
+    # Step 1: Only protect code regions, NOT tables
+    protected_regions = []
+    
+    def protect_region(match):
+        content = match.group(0)
+        placeholder = f"__PROTECTED_{len(protected_regions)}__"
+        protected_regions.append(content)
+        return placeholder
+    
+    # Only protect code-related patterns - DO NOT protect tables
+    patterns_to_protect = [
+        r'```[\s\S]*?```',  # Code blocks
+        r'`[^`\n]*?`',      # Inline code only
+        # Programming patterns (but not tables!)
+        r'#include\s*<[^>]+>', # C++ includes
+        r'\b(?:cout|cin|std::)\b[^.\n]*?;',  # C++ statements
+        r'\bfor\s*\([^)]*\)\s*\{[^}]*\}',   # For loops
+        r'\bwhile\s*\([^)]*\)\s*\{[^}]*\}', # While loops
+        r'\bif\s*\([^)]*\)\s*\{[^}]*\}',    # If statements
+    ]
+    
+    working_text = text
+    for pattern in patterns_to_protect:
+        working_text = re.sub(pattern, protect_region, working_text, flags=re.MULTILINE | re.DOTALL)
+    
+    # Step 2: Apply LaTeX conversion to remaining text (including tables)
+    # Simple replacements for common LaTeX symbols
+    latex_replacements = {
+        r'\\cdot\b': '·', r'\\times\b': '×', r'\\div\b': '÷', r'\\pm\b': '±',
+        r'\\leq\b': '≤', r'\\geq\b': '≥', r'\\neq\b': '≠', r'\\approx\b': '≈',
+        r'\\alpha\b': 'α', r'\\beta\b': 'β', r'\\gamma\b': 'γ', r'\\delta\b': 'δ',
+        r'\\pi\b': 'π', r'\\sigma\b': 'σ', r'\\lambda\b': 'λ', r'\\mu\b': 'μ',
+        r'\\rightarrow\b': '→', r'\\to\b': '→', r'\\leftarrow\b': '←',
+        r'\\sum\b': 'Σ', r'\\prod\b': 'Π', r'\\int\b': '∫',
+        r'\\infty\b': '∞', r'\\emptyset\b': '∅',
+    }
+    
+    for latex_pattern, replacement in latex_replacements.items():
+        working_text = re.sub(latex_pattern, replacement, working_text)
+    
+    # Handle fractions \frac{a}{b} -> a/b
+    def replace_fraction(match):
+        numerator = match.group(1).strip()
+        denominator = match.group(2).strip()
+        if len(numerator) <= 3 and len(denominator) <= 3:
+            return f'{numerator}/{denominator}'
+        else:
+            return f'({numerator})/({denominator})'
+    
+    working_text = re.sub(r'\\frac\{([^{}]+)\}\{([^{}]+)\}', replace_fraction, working_text)
+    
+    # Step 3: Restore protected regions
+    for i, protected_content in enumerate(protected_regions):
+        placeholder = f"__PROTECTED_{i}__"
+        working_text = working_text.replace(placeholder, protected_content)
+    
+    return working_text
+
+def is_table_line(line: str) -> bool:
+    """Check if a line is part of a markdown table"""
+    stripped = line.strip()
+    # Table data line: starts and ends with |, has at least 2 |
+    if stripped.startswith('|') and stripped.endswith('|') and stripped.count('|') >= 2:
+        return True
+    # Table separator line: |---|---| or |:---|---:| etc
+    if (stripped.startswith('|') and 
+        all(c in '|-: \t' for c in stripped) and
+        '-' in stripped and stripped.count('|') >= 2):
+        return True
+    return False
+
+def find_complete_table(lines: list, start_idx: int) -> tuple:
+    """Find the complete table boundaries starting from any table line"""
+    if start_idx >= len(lines) or not is_table_line(lines[start_idx]):
+        return start_idx, start_idx
+    
+    # Find table start (go backwards)
+    table_start = start_idx
+    while table_start > 0 and is_table_line(lines[table_start - 1]):
+        table_start -= 1
+    
+    # Find table end (go forwards)
+    table_end = start_idx
+    while table_end < len(lines) - 1 and is_table_line(lines[table_end + 1]):
+        table_end += 1
+    
+    return table_start, table_end
+
+def handle_large_table(table_lines: list, max_length: int, chunks: list, current_chunk: str) -> str:
+    """Handle tables that are too large to fit in one message"""
+    # Try to identify header vs data
+    header_lines = []
+    data_lines = []
+    
+    # Usually first 2 lines are header + separator
+    for j, tline in enumerate(table_lines):
+        if j < 2:
+            header_lines.append(tline)
+        else:
+            data_lines.append(tline)
+    
+    if len(header_lines) >= 2:
+        header_text = '\n'.join(header_lines)
+        if len(header_text) <= max_length:
+            # Start with header
+            current_table_chunk = header_text
+            
+            # Add data lines one by one
+            for data_line in data_lines:
+                test_line = current_table_chunk + '\n' + data_line
+                if len(test_line) <= max_length:
+                    current_table_chunk = test_line
+                else:
+                    # Current chunk is full, save it
+                    chunks.append(current_table_chunk)
+                    # Start new chunk with header + current data line
+                    current_table_chunk = header_text + '\n' + data_line
+            
+            return current_table_chunk
+        else:
+            # Even header is too long, fallback to line by line
+            result_chunk = current_chunk
+            for tline in table_lines:
+                test_line = result_chunk + ('\n' if result_chunk else '') + tline
+                if len(test_line) <= max_length:
+                    result_chunk = test_line
+                else:
+                    if result_chunk:
+                        chunks.append(result_chunk)
+                    result_chunk = tline
+            return result_chunk
+    else:
+        # Fallback: process line by line
+        result_chunk = current_chunk
+        for tline in table_lines:
+            test_line = result_chunk + ('\n' if result_chunk else '') + tline
+            if len(test_line) <= max_length:
+                result_chunk = test_line
+            else:
+                if result_chunk:
+                    chunks.append(result_chunk)
+                result_chunk = tline
+        return result_chunk
+
+def handle_long_line(line: str, max_length: int, chunks: list) -> str:
+    """Handle individual lines that are too long"""
+    if len(line) <= max_length:
+        return line
+        
+    # Preserve indentation
+    leading_whitespace = re.match(r'^(\s*)', line).group(1)
+    line_content = line[len(leading_whitespace):]
+    
+    # Try to split at natural break points
+    current_content = ""
+    words = line_content.split()
+    
+    for word in words:
+        test_line = leading_whitespace + current_content + (' ' if current_content else '') + word
+        
+        if len(test_line) <= max_length:
+            current_content += (' ' if current_content else '') + word
+        else:
+            if current_content:
+                chunks.append(leading_whitespace + current_content)
+                current_content = word
+            else:
+                # Single word is too long - force split
+                while len(word) > max_length - len(leading_whitespace):
+                    available_space = max_length - len(leading_whitespace)
+                    chunks.append(leading_whitespace + word[:available_space])
+                    word = word[available_space:]
+                current_content = word
+    
+    return leading_whitespace + current_content if current_content else ""
+
+def split_message_smart(text: str, max_length: int = 2000) -> list[str]:
+    """Enhanced smart message splitting that preserves tables, code blocks, and context"""
+    if len(text) <= max_length:
+        return [text]
+    
+    chunks = []
+    current_chunk = ""
+    in_code_block = False
+    code_block_lang = ""
+    
+    lines = text.split('\n')
+    i = 0
+    
+    while i < len(lines):
+        line = lines[i]
+        
+        # Handle code blocks
+        code_match = re.match(r'^```(\w*)', line.strip())
+        if code_match:
+            if not in_code_block:
+                in_code_block = True
+                code_block_lang = code_match.group(1)
+            elif line.strip() == '```':
+                in_code_block = False
+                code_block_lang = ""
+        
+        # Handle tables (only when NOT in code block)
+        if is_table_line(line) and not in_code_block:
+            table_start, table_end = find_complete_table(lines, i)
+            
+            # Get the entire table as one unit
+            table_lines = lines[table_start:table_end + 1]
+            table_text = '\n'.join(table_lines)
+            
+            # Try to add the complete table to current chunk
+            test_chunk = current_chunk + ('\n' if current_chunk else '') + table_text
+            
+            if len(test_chunk) <= max_length:
+                # Table fits in current chunk
+                current_chunk = test_chunk
+            else:
+                # Table doesn't fit
+                if current_chunk:
+                    # Save current chunk first
+                    if in_code_block:
+                        current_chunk += '\n```'
+                    chunks.append(current_chunk)
+                    if in_code_block:
+                        current_chunk = f'```{code_block_lang}'
+                    else:
+                        current_chunk = ""
+                
+                # Handle the table
+                if len(table_text) <= max_length:
+                    # Table fits in its own chunk
+                    current_chunk = table_text
+                else:
+                    # Table is too large - split more intelligently
+                    current_chunk = handle_large_table(table_lines, max_length, chunks, current_chunk)
+            
+            # Skip to after the table
+            i = table_end + 1
+            continue
+        
+        # Regular line processing (not part of a table)
+        test_chunk = current_chunk + ('\n' if current_chunk else '') + line
+        
+        if len(test_chunk) > max_length:
+            if current_chunk:
+                # Save current chunk
+                if in_code_block:
+                    current_chunk += '\n```'
+                    chunks.append(current_chunk)
+                    current_chunk = f'```{code_block_lang}\n{line}'
+                else:
+                    chunks.append(current_chunk)
+                    current_chunk = line
+            else:
+                # Single line is too long - split it preserving structure
+                current_chunk = handle_long_line(line, max_length, chunks)
+        else:
+            current_chunk = test_chunk
+        
+        i += 1
+    
+    if current_chunk:
+        chunks.append(current_chunk)
+    
+    # Post-process chunks to ensure no empty chunks and proper formatting
+    final_chunks = []
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if chunk:
+            final_chunks.append(chunk)
+    
+    return final_chunks if final_chunks else ["[Empty response]"]
+
+async def send_long_message(channel, content: str, max_msg_length: int = 2000):
+    """Send long message with proper table handling"""
+    try:
+        # First apply LaTeX conversion (which now preserves tables)
+        formatted_content = convert_latex_to_discord(content)
+        
+        if len(formatted_content) <= max_msg_length:
+            await channel.send(formatted_content, allowed_mentions=discord.AllowedMentions.none())
+            return
+        
+        chunks = split_message_smart(formatted_content, max_msg_length)
+        
+        for i, chunk in enumerate(chunks):
+            if i > 0:  # Add delay between messages
+                await asyncio.sleep(0.5)
+            await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as e:
+        logger.exception("Error in send_long_message")
+        try:
+            await channel.send(f"Error sending message: {str(e)[:100]}", 
+                             allowed_mentions=discord.AllowedMentions.none())
+        except:
+            pass
+
+async def send_long_message_with_reference(channel, content: str, reference_message: discord.Message, max_msg_length: int = 2000):
+    """Enhanced version with better error handling and retry logic"""
+    try:
+        # First apply LaTeX conversion (which now preserves tables)
+        formatted_content = convert_latex_to_discord(content)
+        
+        if len(formatted_content) <= max_msg_length:
+            await channel.send(
+                formatted_content,
+                reference=reference_message,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            return
+        
+        chunks = split_message_smart(formatted_content, max_msg_length)
+        
+        for i, chunk in enumerate(chunks):
+            try:
+                if i > 0:  # Add delay between messages
+                    await asyncio.sleep(0.5)  # Slightly longer delay
+                
+                # Only reference the original message for the first chunk
+                ref = reference_message if i == 0 else None
+                await channel.send(
+                    chunk,
+                    reference=ref,
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            except discord.errors.HTTPException as e:
+                if "Must be 2000 or fewer in length" in str(e):
+                    # Chunk is still too long - force split further
+                    logger.warning(f"Chunk {i} still too long ({len(chunk)} chars), force splitting")
+                    mini_chunks = split_message_smart(chunk, max_msg_length - 100)  # Leave buffer
+                    for j, mini_chunk in enumerate(mini_chunks):
+                        await asyncio.sleep(0.3)
+                        ref = reference_message if i == 0 and j == 0 else None
+                        await channel.send(
+                            mini_chunk,
+                            reference=ref,
+                            allowed_mentions=discord.AllowedMentions.none()
+                        )
+                else:
+                    logger.error(f"Failed to send chunk {i}: {e}")
+                    # Try to send error message
+                    try:
+                        await channel.send(
+                            f"Error sending part {i+1} of response: {str(e)[:100]}",
+                            allowed_mentions=discord.AllowedMentions.none()
+                        )
+                    except:
+                        pass
+            except Exception as e:
+                logger.exception(f"Unexpected error sending chunk {i}")
+                
+    except Exception as e:
+        logger.exception("Critical error in send_long_message_with_reference")
+        try:
+            await channel.send(
+                f"Critical error sending response: {str(e)[:100]}",
+                reference=reference_message,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+        except:
+            pass
+
+# ------------------------------------------------------------------
+# AI Request Processing Function with Enhanced Long Message Support
+# ------------------------------------------------------------------
+
+def get_vietnam_timestamp() -> str:
+    """Get current timestamp in GMT+7 (Vietnam timezone)"""
+    vietnam_tz = timezone(timedelta(hours=7))
+    now = datetime.now(vietnam_tz)
+    
+    formatted_time = now.strftime("%A, %B %d, %Y - %H:%M:%S")
+    return f"Thời Gian hiện tại: {formatted_time} (GMT+7) : "
+
+async def deduct_credits(user_id: int, amount: int) -> bool:
+    """Deduct credits from user balance"""
+    if not _use_mongodb_auth or not _mongodb_store:
+        return True
+        
+    success, remaining = _mongodb_store.deduct_user_credit(user_id, amount)
+    if not success:
+        logger.error(f"Failed to deduct {amount} credits from user {user_id}")
+    else:
+        logger.info(f"Deducted {amount} credits from user {user_id}. Remaining: {remaining}")
+    return success
+
+async def check_model_access(message, model_info, user_id) -> bool:
+    """Check if user has access to model"""
+    if not model_info:
+        return True
+        
+    # Check level
+    user_config = _user_config_manager.get_user_config(user_id)
+    user_level = user_config.get("access_level", 0)
+    required_level = model_info.get("access_level", 0)
+    
+    if user_level < required_level:
+        await message.channel.send(
+            f"⛔ This model requires access level {required_level}. Your level: {user_level}",
+            reference=message,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        return False
+        
+    # Check credits
+    cost = model_info.get("credit_cost", 0)
+    if cost > 0:
+        current_credit = user_config.get("credit", 0)
+        if current_credit < cost:
+            await message.channel.send(
+                f"⛔ Insufficient credits. This model costs {cost} credits per use. Your balance: {current_credit}",
+                reference=message,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            return False
+            
+    return True
+
+async def process_ai_request(request):
+    """Process a single AI request from the queue with enhanced stream support"""
+    message = request.message
+    final_user_text = request.final_user_text
+    user_id = message.author.id
+    
+    try:
+        # Get user configuration
+        user_model = _user_config_manager.get_user_model(user_id)
+        
+        # Check if using a profile model
+        profile = None
+        if _use_mongodb_auth:
+            profile = _mongodb_store.get_profile_model(user_model)
+        
+        if profile:
+            # Use profile settings
+            user_model = profile["base_model"]
+            user_system_message = {"role": "system", "content": profile["sys_prompt"]}
+            is_live = profile.get("is_live", False)
+            
+            # Check access level and credits
+            model_info = {"credit_cost": profile["credit_cost"], "access_level": profile["access_level"]}
+            if not await check_model_access(message, model_info, user_id):
+                return
+        else:
+            # Use regular user settings
+            user_system_message = _user_config_manager.get_user_system_message(user_id)
+            is_live = "live-preview" in user_model
+            
+            if _use_mongodb_auth:
+                model_info = _mongodb_store.get_model_info(user_model)
+                if not await check_model_access(message, model_info, user_id):
+                    return
+        
+        # Build message payload
+        payload_messages = [user_system_message]
+        if _memory_store:
+            payload_messages.extend(_memory_store.get_user_messages(user_id))
+            
+            final_user_text = f"{get_vietnam_timestamp()}{final_user_text}"
+        payload_messages.append({"role": "user", "content": final_user_text})
+
+        # Stream or regular response
+        if is_live:
+            # STREAMING RESPONSE - Enhanced version with proper long message handling
+            collected_response = ""
+            last_update = 0
+            response_msg = None
+            message_chunks = []  # Track multiple messages for long responses
+            
+            # Process stream
+            async for chunk in _call_api.call_openai_proxy_stream(payload_messages, user_model):
+                collected_response += chunk
+                
+                # Update message every 1 second or when chunk is large
+                current_time = time.time()
+                if (current_time - last_update > 1 or len(chunk) > 100) and collected_response:
+                    formatted_response = convert_latex_to_discord(collected_response)
+                    
+                    try:
+                        # Check if current response fits in single message
+                        if len(formatted_response) <= 2000:
+                            if response_msg is None:
+                                # Create first message
+                                response_msg = await message.channel.send(
+                                    formatted_response,
+                                    reference=message,
+                                    allowed_mentions=discord.AllowedMentions.none()
+                                )
+                                message_chunks = [response_msg]
+                            else:
+                                # Update existing message
+                                await response_msg.edit(content=formatted_response)
+                        else:
+                            # Response is too long - need to split into multiple messages
+                            chunks = split_message_smart(formatted_response, 2000)
+                            
+                            # Update existing messages and create new ones as needed
+                            for i, chunk_content in enumerate(chunks):
+                                if i < len(message_chunks):
+                                    # Update existing message
+                                    await message_chunks[i].edit(content=chunk_content)
+                                else:
+                                    # Create new message
+                                    new_msg = await message.channel.send(
+                                        chunk_content,
+                                        reference=message if i == 0 and len(message_chunks) == 0 else None,
+                                        allowed_mentions=discord.AllowedMentions.none()
+                                    )
+                                    message_chunks.append(new_msg)
+                                    await asyncio.sleep(0.3)  # Small delay between messages
+                            
+                            # If we have fewer chunks now, delete extra messages
+                            while len(message_chunks) > len(chunks):
+                                extra_msg = message_chunks.pop()
+                                try:
+                                    await extra_msg.delete()
+                                except:
+                                    pass
+                        
+                        last_update = current_time
+                    except discord.errors.HTTPException as e:
+                        if "Must be 2000 or fewer in length" in str(e):
+                            # Force split the message
+                            formatted_response = convert_latex_to_discord(collected_response)
+                            chunks = split_message_smart(formatted_response, 2000)
+                            
+                            if response_msg is None:
+                                # Send as multiple messages from start
+                                for i, chunk_content in enumerate(chunks):
+                                    msg = await message.channel.send(
+                                        chunk_content,
+                                        reference=message if i == 0 else None,
+                                        allowed_mentions=discord.AllowedMentions.none()
+                                    )
+                                    message_chunks.append(msg)
+                                    if i > 0:
+                                        await asyncio.sleep(0.3)
+                                if message_chunks:
+                                    response_msg = message_chunks[0]
+                            last_update = current_time
+                        else:
+                            logger.error(f"Failed to update stream message: {e}")
+                            
+            # Final update and process completion
+            if collected_response:
+                final_response = convert_latex_to_discord(collected_response)
+                
+                # Final update with complete response
+                if len(final_response) <= 2000:
+                    if response_msg is None:
+                        response_msg = await message.channel.send(
+                            final_response,
+                            reference=message,
+                            allowed_mentions=discord.AllowedMentions.none()
+                        )
+                    else:
+                        await response_msg.edit(content=final_response)
+                        # Clean up any extra messages
+                        for i in range(1, len(message_chunks)):
+                            try:
+                                await message_chunks[i].delete()
+                            except:
+                                pass
+                else:
+                    # Send as multiple messages using the smart splitting
+                    await send_long_message_with_reference(
+                        message.channel, 
+                        final_response, 
+                        message
+                    )
+                    # Clean up streaming messages if any
+                    for msg in message_chunks:
+                        try:
+                            await msg.delete()
+                        except:
+                            pass
+                
+                # Save to memory store
+                if _memory_store:
+                    _memory_store.add_message(user_id, {"role": "user", "content": final_user_text})
+                    _memory_store.add_message(user_id, {"role": "assistant", "content": collected_response})
+                    
+                # Deduct credits after successful completion
+                if _use_mongodb_auth and model_info:
+                    await deduct_credits(user_id, model_info.get("credit_cost", 0))
+                    
+        else:
+            # NON-STREAMING RESPONSE - Use enhanced long message handler
+            ok, resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                _call_api.call_openai_proxy,
+                payload_messages,
+                user_model
+            )
+            
+            if ok and resp:
+                # Use the smart long message handler
+                await send_long_message_with_reference(message.channel, resp, message)
+                
+                # Save to memory store
+                if _memory_store:
+                    _memory_store.add_message(user_id, {"role": "user", "content": final_user_text})
+                    _memory_store.add_message(user_id, {"role": "assistant", "content": resp})
+                
+                # Deduct credits after successful completion    
+                if _use_mongodb_auth and model_info:
+                    await deduct_credits(user_id, model_info.get("credit_cost", 0))
+            else:
+                error_msg = resp or "Unknown error"
+                await message.channel.send(
+                    f"⚠ Error: {error_msg}",
+                    reference=message,
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+
+    except Exception as e:
+        logger.exception(f"Error in request processing for user {user_id}")
+        await message.channel.send(
+            f"⚠️ Internal error: {e}",
+            reference=message,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+
+# ------------------------------------------------------------------
 # SLASH COMMAND HANDLERS
 # ------------------------------------------------------------------
 
@@ -230,33 +860,33 @@ async def help_slash(interaction: discord.Interaction):
 
     lines = [
         "**Available commands:**",
-        "`/getid <>` — Show your ID (or a mention). (everyone)",
-        "`/ping` — Check bot responsiveness. (everyone)",
+        "`/getid <>` – Show your ID (or a mention). (everyone)",
+        "`/ping` – Check bot responsiveness. (everyone)",
         "",
         "**Configuration commands (authorized users):**",
-        "`/set model <model>` — Set your preferred AI model.",
-        "`/set sys_prompt <prompt>` — Set your system prompt.", 
-        "`/show profile <user>` — Show user configuration.",
+        "`/set model <model>` – Set your preferred AI model.",
+        "`/set sys_prompt <prompt>` – Set your system prompt.", 
+        "`/show profile <user>` – Show user configuration.",
         "`/show sys_prompt <user>` - View system prompt.",
-        "`/show models` — Show all supported models.",
-        "`/clearmemory <user>` — Clear conversation history."
+        "`/show models` – Show all supported models.",
+        "`/clearmemory <user>` – Clear conversation history."
     ]
 
     if is_owner:
         lines += [
             "",
             "**Owner‑only commands:**",
-            "`/auth <user>` — Add a user to authorized list.",
-            "`/deauth <user>` — Remove user from authorized list.",
-            "`/show auth` — List authorized users.",
-            "`/memory <user>` — View conversation history.",
+            "`/auth <user>` – Add a user to authorized list.",
+            "`/deauth <user>` – Remove user from authorized list.",
+            "`/show auth` – List authorized users.",
+            "`/memory <user>` – View conversation history.",
             "",
             "**Model management (owner only):**",
-            "`/add model <name> <cost> <level>` — Add a new model",
+            "`/add model <name> <cost> <level>` – Add a new model",
             "  - cost: Cost in credits per use",
             "  - level: Required user level (0=Basic, 1=Advanced, 2=Premium, 3=Ultimate)",
-            "`/remove model <name>` — Remove a model",
-            "`/edit model <name> <cost> <level>` — Edit model settings",
+            "`/remove model <name>` – Remove a model",
+            "`/edit model <name> <cost> <level>` – Edit model settings",
             "",
             "**Profile Model Management (owner only):**",
             "`/add pmodel <name>` - Create new profile model",
@@ -406,10 +1036,10 @@ async def show_profile_slash(interaction: discord.Interaction, user: discord.Mem
 
     # Build profile display without system prompt
     lines = [
-        f"**👤 Profile for {target_user}:**",
-        f"🤖 **Current Model**: {model}",
-        f"💰 **Credit Balance**: {credit}",
-        f"🔒 **Access Level**: {level_desc}",
+        f"**Profile for {target_user}:**",
+        f"**Current Model**: {model}",
+        f"**Credit Balance**: {credit}",
+        f"**Access Level**: {level_desc}",
         "",
         "Use `/show sys_prompt` to view system prompt."
     ]
@@ -439,7 +1069,7 @@ async def show_sys_prompt_slash(interaction: discord.Interaction, user: discord.
     
     # Format display
     lines = [   
-        f"**📝 System Prompt for {target_user}:**",
+        f"**System Prompt for {target_user}:**",
         "```",
         prompt,
         "```",
@@ -666,6 +1296,7 @@ async def memory_slash(interaction: discord.Interaction, user: discord.Member = 
         lines.append(f"{i:02d}. **{msg['role']}**: {preview}")
 
     await interaction.response.send_message("\n".join(lines))
+
 @app_commands.command(name="clearmemory", description="Clear conversation history")
 @app_commands.describe(user="The user to clear memory for (optional - owner only for others)")
 async def clearmemory_slash(interaction: discord.Interaction, user: discord.Member = None):
@@ -906,471 +1537,6 @@ async def edit_pmodel_slash(interaction: discord.Interaction, name: str, field: 
     await interaction.response.send_message(message)
 
 # ------------------------------------------------------------------
-# AI Request Processing Function (unchanged from original)
-# ------------------------------------------------------------------
-
-async def deduct_credits(user_id: int, amount: int) -> bool:
-    """Deduct credits from user balance"""
-    if not _use_mongodb_auth or not _mongodb_store:
-        return True
-        
-    success, remaining = _mongodb_store.deduct_user_credit(user_id, amount)
-    if not success:
-        logger.error(f"Failed to deduct {amount} credits from user {user_id}")
-    else:
-        logger.info(f"Deducted {amount} credits from user {user_id}. Remaining: {remaining}")
-    return success
-
-def get_vietnam_timestamp() -> str:
-    """Get current timestamp in GMT+7 (Vietnam timezone)"""
-    vietnam_tz = timezone(timedelta(hours=7))
-    now = datetime.now(vietnam_tz)
-    
-    formatted_time = now.strftime("%A, %B %d, %Y - %H:%M:%S")
-    return f"Thời Gian hiện tại: {formatted_time} (GMT+7) : "
-    
-async def process_ai_request(request):
-    """Process a single AI request from the queue with stream support"""
-    message = request.message
-    final_user_text = request.final_user_text
-    user_id = message.author.id
-    
-    try:
-        # Get user configuration
-        user_model = _user_config_manager.get_user_model(user_id)
-        
-        # Check if using a profile model
-        profile = None
-        if _use_mongodb_auth:
-            profile = _mongodb_store.get_profile_model(user_model)
-        
-        if profile:
-            # Use profile settings
-            user_model = profile["base_model"]
-            user_system_message = {"role": "system", "content": profile["sys_prompt"]}
-            is_live = profile.get("is_live", False)
-            
-            # Check access level and credits
-            model_info = {"credit_cost": profile["credit_cost"], "access_level": profile["access_level"]}
-            if not await check_model_access(message, model_info, user_id):
-                return
-        else:
-            # Use regular user settings
-            user_system_message = _user_config_manager.get_user_system_message(user_id)
-            is_live = "live-preview" in user_model
-            
-            if _use_mongodb_auth:
-                model_info = _mongodb_store.get_model_info(user_model)
-                if not await check_model_access(message, model_info, user_id):
-                    return
-        
-        # Build message payload
-        payload_messages = [user_system_message]
-        if _memory_store:
-            payload_messages.extend(_memory_store.get_user_messages(user_id))
-            
-            final_user_text = f"{get_vietnam_timestamp()}{final_user_text}"
-        payload_messages.append({"role": "user", "content": final_user_text})
-
-        # Create initial response message
-        response_msg = await message.channel.send(
-            "...",
-            reference=message,
-            allowed_mentions=discord.AllowedMentions.none()
-        )
-
-        # Stream or regular response
-        if is_live:
-            collected_response = ""
-            last_update = 0
-            
-            # Process stream
-            async for chunk in _call_api.call_openai_proxy_stream(payload_messages, user_model):
-                collected_response += chunk
-                
-                # Update message every 1 second or when chunk is large
-                current_time = time.time()
-                if (current_time - last_update > 1 or len(chunk) > 100) and collected_response:
-                    formatted_response = convert_latex_to_discord(collected_response)
-                    try:
-                        await response_msg.edit(content=formatted_response)
-                        last_update = current_time
-                    except Exception as e:
-                        logger.error(f"Failed to update stream message: {e}")
-                        
-            # Final update and process completion
-            if collected_response:
-                final_response = convert_latex_to_discord(collected_response)
-                await response_msg.edit(content=final_response)
-                
-                # Save to memory store
-                if _memory_store:
-                    _memory_store.add_message(user_id, {"role": "user", "content": final_user_text})
-                    _memory_store.add_message(user_id, {"role": "assistant", "content": collected_response})
-                    
-                # Deduct credits after successful completion
-                if _use_mongodb_auth and model_info:
-                    await deduct_credits(user_id, model_info.get("credit_cost", 0))
-                    
-        else:
-            # Regular non-streaming call - existing code remains unchanged
-            ok, resp = await asyncio.get_event_loop().run_in_executor(
-                None,
-                _call_api.call_openai_proxy,
-                payload_messages,
-                user_model
-            )
-            
-            if ok and resp:
-                formatted_response = convert_latex_to_discord(resp)
-                await response_msg.edit(content=formatted_response)
-                
-                # Save to memory store
-                if _memory_store:
-                    _memory_store.add_message(user_id, {"role": "user", "content": final_user_text})
-                    _memory_store.add_message(user_id, {"role": "assistant", "content": resp})
-                
-                # Deduct credits after successful completion    
-                if _use_mongodb_auth and model_info:
-                    await deduct_credits(user_id, model_info.get("credit_cost", 0))
-            else:
-                error_msg = resp or "Unknown error"
-                await response_msg.edit(content=f"⚠ Error: {error_msg}")
-
-    except Exception as e:
-        logger.exception(f"Error in request processing for user {user_id}")
-        await message.channel.send(
-            f"⚠️ Internal error: {e}",
-            reference=message,
-            allowed_mentions=discord.AllowedMentions.none()
-        )
-
-# Add helper functions
-async def check_model_access(message, model_info, user_id) -> bool:
-    """Check if user has access to model"""
-    if not model_info:
-        return True
-        
-    # Check level
-    user_config = _user_config_manager.get_user_config(user_id)
-    user_level = user_config.get("access_level", 0)
-    required_level = model_info.get("access_level", 0)
-    
-    if user_level < required_level:
-        await message.channel.send(
-            f"⛔ This model requires access level {required_level}. Your level: {user_level}",
-            reference=message,
-            allowed_mentions=discord.AllowedMentions.none()
-        )
-        return False
-        
-    # Check credits
-    cost = model_info.get("credit_cost", 0)
-    if cost > 0:
-        current_credit = user_config.get("credit", 0)
-        if current_credit < cost:
-            await message.channel.send(
-                f"⛔ Insufficient credits. This model costs {cost} credits per use. Your balance: {current_credit}",
-                reference=message,
-                allowed_mentions=discord.AllowedMentions.none()
-            )
-            return False
-            
-    return True
-
-# ------------------------------------------------------------------
-# Message formatting helpers (unchanged from original)
-# ------------------------------------------------------------------
-
-def convert_latex_to_discord(text: str) -> str:
-    """Fixed version - only protect code blocks, NOT markdown tables"""
-    
-    # Step 1: Only protect code regions, NOT tables
-    protected_regions = []
-    
-    def protect_region(match):
-        content = match.group(0)
-        placeholder = f"__PROTECTED_{len(protected_regions)}__"
-        protected_regions.append(content)
-        return placeholder
-    
-    # Only protect code-related patterns - DO NOT protect tables
-    patterns_to_protect = [
-        r'```[\s\S]*?```',  # Code blocks
-        r'`[^`\n]*?`',      # Inline code only
-        # Programming patterns (but not tables!)
-        r'#include\s*<[^>]+>', # C++ includes
-        r'\b(?:cout|cin|std::)\b[^.\n]*?;',  # C++ statements
-        r'\bfor\s*\([^)]*\)\s*\{[^}]*\}',   # For loops
-        r'\bwhile\s*\([^)]*\)\s*\{[^}]*\}', # While loops
-        r'\bif\s*\([^)]*\)\s*\{[^}]*\}',    # If statements
-    ]
-    
-    working_text = text
-    for pattern in patterns_to_protect:
-        working_text = re.sub(pattern, protect_region, working_text, flags=re.MULTILINE | re.DOTALL)
-    
-    # Step 2: Apply LaTeX conversion to remaining text (including tables)
-    # Simple replacements for common LaTeX symbols
-    latex_replacements = {
-        r'\\cdot\b': '·', r'\\times\b': '×', r'\\div\b': '÷', r'\\pm\b': '±',
-        r'\\leq\b': '≤', r'\\geq\b': '≥', r'\\neq\b': '≠', r'\\approx\b': '≈',
-        r'\\alpha\b': 'α', r'\\beta\b': 'β', r'\\gamma\b': 'γ', r'\\delta\b': 'δ',
-        r'\\pi\b': 'π', r'\\sigma\b': 'σ', r'\\lambda\b': 'λ', r'\\mu\b': 'μ',
-        r'\\rightarrow\b': '→', r'\\to\b': '→', r'\\leftarrow\b': '←',
-        r'\\sum\b': 'Σ', r'\\prod\b': 'Π', r'\\int\b': '∫',
-        r'\\infty\b': '∞', r'\\emptyset\b': '∅',
-    }
-    
-    for latex_pattern, replacement in latex_replacements.items():
-        working_text = re.sub(latex_pattern, replacement, working_text)
-    
-    # Handle fractions \frac{a}{b} -> a/b
-    def replace_fraction(match):
-        numerator = match.group(1).strip()
-        denominator = match.group(2).strip()
-        if len(numerator) <= 3 and len(denominator) <= 3:
-            return f'{numerator}/{denominator}'
-        else:
-            return f'({numerator})/({denominator})'
-    
-    working_text = re.sub(r'\\frac\{([^{}]+)\}\{([^{}]+)\}', replace_fraction, working_text)
-    
-    # Step 3: Restore protected regions
-    for i, protected_content in enumerate(protected_regions):
-        placeholder = f"__PROTECTED_{i}__"
-        working_text = working_text.replace(placeholder, protected_content)
-    
-    return working_text
-
-def is_table_line(line: str) -> bool:
-    """Check if a line is part of a markdown table"""
-    stripped = line.strip()
-    # Table data line: starts and ends with |, has at least 2 |
-    if stripped.startswith('|') and stripped.endswith('|') and stripped.count('|') >= 2:
-        return True
-    # Table separator line: |---|---| or |:---|---:| etc
-    if (stripped.startswith('|') and 
-        all(c in '|-: \t' for c in stripped) and
-        '-' in stripped and stripped.count('|') >= 2):
-        return True
-    return False
-
-def find_complete_table(lines: list, start_idx: int) -> tuple:
-    """Find the complete table boundaries starting from any table line"""
-    if start_idx >= len(lines) or not is_table_line(lines[start_idx]):
-        return start_idx, start_idx
-    
-    # Find table start (go backwards)
-    table_start = start_idx
-    while table_start > 0 and is_table_line(lines[table_start - 1]):
-        table_start -= 1
-    
-    # Find table end (go forwards)
-    table_end = start_idx
-    while table_end < len(lines) - 1 and is_table_line(lines[table_end + 1]):
-        table_end += 1
-    
-    return table_start, table_end
-
-def split_message_smart(text: str, max_length: int = 2000) -> list[str]:
-    """Smart message splitting that keeps tables intact"""
-    if len(text) <= max_length:
-        return [text]
-    
-    chunks = []
-    current_chunk = ""
-    in_code_block = False
-    code_block_lang = ""
-    
-    lines = text.split('\n')
-    i = 0
-    
-    while i < len(lines):
-        line = lines[i]
-        
-        # Handle code blocks
-        code_match = re.match(r'^```(\w*)', line.strip())
-        if code_match:
-            if not in_code_block:
-                in_code_block = True
-                code_block_lang = code_match.group(1)
-            else:
-                in_code_block = False
-                code_block_lang = ""
-        
-        # Handle tables (only when NOT in code block)
-        if is_table_line(line) and not in_code_block:
-            table_start, table_end = find_complete_table(lines, i)
-            
-            # Get the entire table as one unit
-            table_lines = lines[table_start:table_end + 1]
-            table_text = '\n'.join(table_lines)
-            
-            # Try to add the complete table to current chunk
-            test_chunk = current_chunk + ('\n' if current_chunk else '') + table_text
-            
-            if len(test_chunk) <= max_length:
-                # Table fits in current chunk
-                current_chunk = test_chunk
-            else:
-                # Table doesn't fit
-                if current_chunk:
-                    # Save current chunk first
-                    if in_code_block:
-                        current_chunk += '\n```'
-                    chunks.append(current_chunk)
-                    if in_code_block:
-                        current_chunk = f'```{code_block_lang}'
-                    else:
-                        current_chunk = ""
-                
-                # Handle the table
-                if len(table_text) <= max_length:
-                    # Table fits in its own chunk
-                    current_chunk = table_text
-                else:
-                    # Table is too large - need to split it intelligently
-                    # Keep header + separator together if possible
-                    header_lines = []
-                    data_lines = []
-                    
-                    # Try to identify header vs data
-                    for j, tline in enumerate(table_lines):
-                        if j < 2:  # Usually header + separator
-                            header_lines.append(tline)
-                        else:
-                            data_lines.append(tline)
-                    
-                    if len(header_lines) >= 2:
-                        header_text = '\n'.join(header_lines)
-                        if len(header_text) <= max_length:
-                            # Start with header
-                            current_table_chunk = header_text
-                            
-                            # Add data lines one by one
-                            for data_line in data_lines:
-                                test_line = current_table_chunk + '\n' + data_line
-                                if len(test_line) <= max_length:
-                                    current_table_chunk = test_line
-                                else:
-                                    # Current chunk is full, save it
-                                    chunks.append(current_table_chunk)
-                                    # Start new chunk with header + current data line
-                                    current_table_chunk = header_text + '\n' + data_line
-                            
-                            current_chunk = current_table_chunk
-                        else:
-                            # Even header is too long, fallback to line by line
-                            for tline in table_lines:
-                                test_line = current_chunk + ('\n' if current_chunk else '') + tline
-                                if len(test_line) <= max_length:
-                                    current_chunk = test_line
-                                else:
-                                    if current_chunk:
-                                        chunks.append(current_chunk)
-                                    current_chunk = tline
-                    else:
-                        # Fallback: process line by line
-                        for tline in table_lines:
-                            test_line = current_chunk + ('\n' if current_chunk else '') + tline
-                            if len(test_line) <= max_length:
-                                current_chunk = test_line
-                            else:
-                                if current_chunk:
-                                    chunks.append(current_chunk)
-                                current_chunk = tline
-            
-            # Skip to after the table
-            i = table_end + 1
-            continue
-        
-        # Regular line processing (not part of a table)
-        test_chunk = current_chunk + ('\n' if current_chunk else '') + line
-        
-        if len(test_chunk) > max_length:
-            if current_chunk:
-                # Save current chunk
-                if in_code_block:
-                    current_chunk += '\n```'
-                    chunks.append(current_chunk)
-                    current_chunk = f'```{code_block_lang}\n{line}'
-                else:
-                    chunks.append(current_chunk)
-                    current_chunk = line
-            else:
-                # Single line is too long - split it
-                if len(line) > max_length:
-                    # Preserve indentation
-                    leading_whitespace = re.match(r'^(\s*)', line).group(1)
-                    line_content = line[len(leading_whitespace):]
-                    
-                    while len(line_content) > max_length - len(leading_whitespace):
-                        available_space = max_length - len(leading_whitespace)
-                        part_content = line_content[:available_space]
-                        chunks.append(leading_whitespace + part_content)
-                        line_content = line_content[available_space:]
-                    
-                    if line_content:
-                        current_chunk = leading_whitespace + line_content
-                else:
-                    current_chunk = line
-        else:
-            current_chunk = test_chunk
-        
-        i += 1
-    
-    if current_chunk:
-        chunks.append(current_chunk)
-    
-    return chunks
-
-# Update the message sending functions
-async def send_long_message(channel, content: str, max_msg_length: int = 2000):
-    """Send long message with proper table handling"""
-    # First apply LaTeX conversion (which now preserves tables)
-    formatted_content = convert_latex_to_discord(content)
-    
-    if len(formatted_content) <= max_msg_length:
-        await channel.send(formatted_content, allowed_mentions=discord.AllowedMentions.none())
-        return
-    
-    chunks = split_message_smart(formatted_content, max_msg_length)
-    
-    for i, chunk in enumerate(chunks):
-        if i > 0:  # Add delay between messages
-            await asyncio.sleep(0.3)
-        await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
-
-
-async def send_long_message_with_reference(channel, content: str, reference_message: discord.Message, max_msg_length: int = 2000):
-    """Send long message with reference and proper table handling"""
-    # First apply LaTeX conversion (which now preserves tables)
-    formatted_content = convert_latex_to_discord(content)
-    
-    if len(formatted_content) <= max_msg_length:
-        await channel.send(
-            formatted_content,
-            reference=reference_message,
-            allowed_mentions=discord.AllowedMentions.none()
-        )
-        return
-    
-    chunks = split_message_smart(formatted_content, max_msg_length)
-    
-    for i, chunk in enumerate(chunks):
-        if i > 0:  # Add delay between messages
-            await asyncio.sleep(0.3)
-        
-        # Only reference the original message for the first chunk
-        ref = reference_message if i == 0 else None
-        await channel.send(
-            chunk,
-            reference=ref,
-            allowed_mentions=discord.AllowedMentions.none()
-        )
-
-# ------------------------------------------------------------------
 # on_message listener — central dispatch point
 # ------------------------------------------------------------------
 async def on_message(message: discord.Message):
@@ -1469,7 +1635,7 @@ async def on_message(message: discord.Message):
     except Exception as e:
         logger.exception("Error adding request to queue")
         await message.channel.send(
-            f"⚠ Error adding request to queue: {e}",
+            f"Error adding request to queue: {e}",
             allowed_mentions=discord.AllowedMentions.none()
         )
 

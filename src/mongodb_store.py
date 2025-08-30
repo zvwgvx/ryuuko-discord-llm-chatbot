@@ -10,7 +10,7 @@ from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 import tiktoken
 import time
 
-logger = logging.getLogger("discord-openai-proxy.mongodb_store")
+logger = logging.getLogger("mongodb_store")
 
 class MongoDBStore:
     """MongoDB storage manager for Discord OpenAI proxy"""

@@ -8,7 +8,7 @@ from collections import deque
 from typing import Dict, List, Union, TypedDict
 import load_config
 
-logger = logging.getLogger("discord-openai-proxy.memory_store")
+logger = logging.getLogger("memory_store")
 
 # Configuration
 CONFIG_DIR = Path(__file__).parent.parent / "config"
