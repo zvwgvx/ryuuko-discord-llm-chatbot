@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
 # coding: utf-8
-# ─────────────────────────────────────────────────────────────────────────────
-# Bot helper / command registry - UPDATED FOR SLASH COMMANDS
+# ────────────────────────────────────────────────────────────────────────────
+# Bot helper / command registry - UPDATED FOR SLASH COMMANDS WITH IMAGE SUPPORT
 # Uses MemoryStore for per‑user conversation history
 # Uses UserConfigManager for per-user model and system prompt settings
 # Uses MongoDB for model management
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
 
 import re
 import json
 import logging
 import asyncio
 import time
+import base64
+import mimetypes
 from pathlib import Path
-from typing import Set, Optional, List, Dict
+from typing import Set, Optional, List, Dict, Union
 from datetime import datetime, timezone, timedelta
 
 import discord
 from discord.ext import commands
 from discord import app_commands
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
 # ***Absolute import — no package, so we use the plain module name ***
 from memory_store import MemoryStore
 from user_config import get_user_config_manager
@@ -45,14 +47,22 @@ _use_mongodb_auth = False
 _mongodb_store = None
 
 # ---------------------------------------------------------------
-# Attachment handling constants
+# Attachment handling constants - UPDATED FOR IMAGES
 # ---------------------------------------------------------------
 FILE_MAX_BYTES = 200 * 1024          # 200 KB per file
+IMAGE_MAX_BYTES = 10 * 1024 * 1024   # 10 MB per image
 MAX_CHARS_PER_FILE = 10_000
-ALLOWED_EXTENSIONS = {
+ALLOWED_TEXT_EXTENSIONS = {
     ".txt", ".md", ".py", ".js", ".java", ".c", ".cpp", ".h",
     ".json", ".yaml", ".yml", ".csv", ".rs", ".go", ".rb",
     ".sh", ".html", ".css", ".ts", ".ini", ".toml",
+}
+ALLOWED_IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"
+}
+ALLOWED_IMAGE_MIMES = {
+    "image/jpeg", "image/jpg", "image/png", "image/gif", 
+    "image/webp", "image/bmp"
 }
 
 # ---------------------------------------------------------------
@@ -156,62 +166,179 @@ def should_respond_default(message: discord.Message) -> bool:
         return True
     return False
 
-# ------------------------------------------------------------------
-# Attachment helpers
-# ------------------------------------------------------------------
-async def _read_attachments_as_text(attachments: List[discord.Attachment]) -> List[Dict]:
-    """Return a list of dicts describing each attachment that looks like text."""
-    result = []
-    for att in attachments:
-        entry = {"filename": att.filename, "text": "", "skipped": False, "reason": None}
+def is_gemini_model(model_name: str) -> bool:
+    """Check if the model is a Gemini model"""
+    return (model_name.startswith("gemini-") or 
+            model_name.startswith("gemma-") or 
+            "live-preview" in model_name)
 
-        # quick size check
+def is_gemini_live_model(model_name: str) -> bool:
+    """Check if the model requires Live API"""
+    live_model_patterns = [
+        "gemini-2.5-flash-live-preview",
+        "gemini-2.5-flash-preview-native-audio-dialog",
+        "gemini-2.5-flash-exp-native-audio-thinking-dialog",
+        "live-preview"
+    ]
+    
+    model_lower = model_name.lower()
+    return any(pattern in model_lower for pattern in live_model_patterns)
+
+# ------------------------------------------------------------------
+# Enhanced Attachment helpers - WITH IMAGE SUPPORT
+# ------------------------------------------------------------------
+
+async def _read_image_attachment(attachment: discord.Attachment) -> Dict:
+    """Process an image attachment for Gemini API"""
+    entry = {
+        "filename": attachment.filename,
+        "type": "image",
+        "data": None,
+        "mime_type": None,
+        "skipped": False,
+        "reason": None
+    }
+
+    try:
+        # Size check
+        size = getattr(attachment, "size", 0) or 0
+        if size > IMAGE_MAX_BYTES:
+            entry["skipped"] = True
+            entry["reason"] = f"image too large ({size} bytes, max {IMAGE_MAX_BYTES})"
+            return entry
+
+        # Content type check
+        content_type = getattr(attachment, "content_type", "") or ""
+        ext = (Path(attachment.filename).suffix or "").lower()
+        
+        if not (content_type in ALLOWED_IMAGE_MIMES or ext in ALLOWED_IMAGE_EXTENSIONS):
+            entry["skipped"] = True
+            entry["reason"] = f"unsupported image type ({content_type}, {ext})"
+            return entry
+
+        # Read image data
+        image_data = await attachment.read()
+        
+        # Convert to base64
+        base64_data = base64.b64encode(image_data).decode('utf-8')
+        
+        # Determine MIME type
+        mime_type = content_type if content_type in ALLOWED_IMAGE_MIMES else mimetypes.guess_type(attachment.filename)[0]
+        if not mime_type:
+            # Fallback based on extension
+            mime_mapping = {
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".png": "image/png", ".gif": "image/gif",
+                ".webp": "image/webp", ".bmp": "image/bmp"
+            }
+            mime_type = mime_mapping.get(ext, "image/jpeg")
+
+        entry["data"] = base64_data
+        entry["mime_type"] = mime_type
+        logger.info(f"Successfully processed image: {attachment.filename} ({size} bytes, {mime_type})")
+
+    except Exception as e:
+        logger.exception(f"Error reading image attachment {attachment.filename}")
+        entry["skipped"] = True
+        entry["reason"] = f"read error: {e}"
+
+    return entry
+
+async def _read_text_attachment(attachment: discord.Attachment) -> Dict:
+    """Process a text attachment"""
+    entry = {"filename": attachment.filename, "type": "text", "text": "", "skipped": False, "reason": None}
+
+    # quick size check
+    try:
+        size = int(getattr(attachment, "size", 0) or 0)
+    except Exception:
+        size = 0
+
+    ext = (Path(attachment.filename).suffix or "").lower()
+    content_type = getattr(attachment, "content_type", "") or ""
+
+    # filter by content‑type / extension
+    if not (
+        content_type.startswith("text")
+        or content_type in ("application/json", "application/javascript")
+        or ext in ALLOWED_TEXT_EXTENSIONS
+    ):
+        entry["skipped"] = True
+        entry["reason"] = f"unsupported file type ({content_type!r}, {ext!r})"
+        return entry
+
+    if size and size > FILE_MAX_BYTES:
+        entry["skipped"] = True
+        entry["reason"] = f"file too large ({size} bytes)"
+        return entry
+
+    try:
+        b = await attachment.read()
         try:
-            size = int(getattr(att, "size", 0) or 0)
+            text = b.decode("utf-8")
         except Exception:
-            size = 0
+            try:
+                text = b.decode("latin-1")
+            except Exception:
+                text = b.decode("utf-8", errors="replace")
 
+        # truncate very long files
+        if len(text) > MAX_CHARS_PER_FILE:
+            text = text[:MAX_CHARS_PER_FILE] + "\n\n...[truncated]..."
+
+        entry["text"] = text
+    except Exception as e:
+        logger.exception("Error reading attachment %s", attachment.filename)
+        entry["skipped"] = True
+        entry["reason"] = f"read error: {e}"
+
+    return entry
+
+async def _read_attachments_enhanced(attachments: List[discord.Attachment]) -> Dict:
+    """Enhanced attachment processing with image support"""
+    result = {
+        "text_files": [],
+        "images": [],
+        "text_summary": "",
+        "has_images": False
+    }
+    
+    for att in attachments:
         ext = (Path(att.filename).suffix or "").lower()
         content_type = getattr(att, "content_type", "") or ""
+        
+        # Determine if this is an image
+        if (content_type in ALLOWED_IMAGE_MIMES or ext in ALLOWED_IMAGE_EXTENSIONS):
+            # Process as image
+            image_entry = await _read_image_attachment(att)
+            result["images"].append(image_entry)
+            if not image_entry["skipped"]:
+                result["has_images"] = True
+        else:
+            # Process as text file
+            text_entry = await _read_text_attachment(att)
+            result["text_files"].append(text_entry)
 
-        # filter by content‑type / extension
-        if not (
-            content_type.startswith("text")
-            or content_type in ("application/json", "application/javascript")
-            or ext in ALLOWED_EXTENSIONS
-        ):
-            entry["skipped"] = True
-            entry["reason"] = f"unsupported file type ({content_type!r}, {ext!r})"
-            result.append(entry)
-            continue
+    # Build text summary for text files
+    attach_summary = []
+    files_combined = ""
+    
+    for fi in result["text_files"]:
+        if fi.get("skipped"):
+            attach_summary.append(f"- {fi['filename']}: SKIPPED ({fi.get('reason')})")
+        else:
+            attach_summary.append(f"- {fi['filename']}: included ({len(fi['text'])} chars)")
+            files_combined += f"Filename: {fi['filename']}\n---\n{fi['text']}\n\n"
+    
+    # Add image summary
+    for img in result["images"]:
+        if img.get("skipped"):
+            attach_summary.append(f"- {img['filename']}: SKIPPED ({img.get('reason')})")
+        else:
+            attach_summary.append(f"- {img['filename']}: image included ({img.get('mime_type')})")
 
-        if size and size > FILE_MAX_BYTES:
-            entry["skipped"] = True
-            entry["reason"] = f"file too large ({size} bytes)"
-            result.append(entry)
-            continue
-
-        try:
-            b = await att.read()
-            try:
-                text = b.decode("utf-8")
-            except Exception:
-                try:
-                    text = b.decode("latin-1")
-                except Exception:
-                    text = b.decode("utf-8", errors="replace")
-
-            # truncate very long files
-            if len(text) > MAX_CHARS_PER_FILE:
-                text = text[:MAX_CHARS_PER_FILE] + "\n\n...[truncated]..."
-
-            entry["text"] = text
-            result.append(entry)
-        except Exception as e:
-            logger.exception("Error reading attachment %s", att.filename)
-            entry["skipped"] = True
-            entry["reason"] = f"read error: {e}"
-            result.append(entry)
+    if attach_summary:
+        result["text_summary"] = "\n".join(attach_summary) + "\n\n" + files_combined
 
     return result
 
@@ -585,7 +712,7 @@ async def send_long_message_with_reference(channel, content: str, reference_mess
             pass
 
 # ------------------------------------------------------------------
-# AI Request Processing Function with Enhanced Long Message Support
+# AI Request Processing Function with Enhanced Image Support
 # ------------------------------------------------------------------
 
 def get_vietnam_timestamp() -> str:
@@ -640,8 +767,58 @@ async def check_model_access(message, model_info, user_id) -> bool:
             
     return True
 
+async def build_message_payload_with_images(user_id: int, final_user_text: str, images: List[Dict]) -> List[Dict]:
+    """Build message payload with image support for Gemini models"""
+    payload_messages = []
+    
+    # Add system message
+    user_system_message = _user_config_manager.get_user_system_message(user_id)
+    payload_messages.append(user_system_message)
+    
+    # Add conversation history if available
+    if _memory_store:
+        payload_messages.extend(_memory_store.get_user_messages(user_id))
+    
+    # Prepare final user message with images
+    final_message_content = []
+    
+    # Add text content
+    if final_user_text:
+        final_message_content.append({
+            "type": "text",
+            "text": f"{get_vietnam_timestamp()}{final_user_text}" if _memory_store else final_user_text
+        })
+    
+    # Add images for Gemini models
+    for img in images:
+        if not img.get("skipped") and img.get("data"):
+            final_message_content.append({
+                "type": "image",
+                "image_data": {
+                    "data": img["data"],
+                    "mime_type": img["mime_type"]
+                }
+            })
+            logger.info(f"Added image to payload: {img['filename']} ({img['mime_type']})")
+    
+    # Create final user message
+    if len(final_message_content) == 1 and final_message_content[0]["type"] == "text":
+        # Simple text-only message
+        payload_messages.append({
+            "role": "user", 
+            "content": final_message_content[0]["text"]
+        })
+    else:
+        # Multi-modal message with images
+        payload_messages.append({
+            "role": "user",
+            "content": final_message_content
+        })
+    
+    return payload_messages
+
 async def process_ai_request(request):
-    """Process a single AI request from the queue with enhanced stream support"""
+    """Process a single AI request from the queue with enhanced image support"""
     message = request.message
     final_user_text = request.final_user_text
     user_id = message.author.id
@@ -674,14 +851,61 @@ async def process_ai_request(request):
                 model_info = _mongodb_store.get_model_info(user_model)
                 if not await check_model_access(message, model_info, user_id):
                     return
+
+        # Check for images and model compatibility
+        attachments = list(message.attachments or [])
+        attachment_data = await _read_attachments_enhanced(attachments)
+        has_images = attachment_data["has_images"]
         
-        # Build message payload
-        payload_messages = [user_system_message]
-        if _memory_store:
-            payload_messages.extend(_memory_store.get_user_messages(user_id))
+        # Validate image support
+        if has_images:
+            if not is_gemini_model(user_model):
+                await message.channel.send(
+                    "🖼️ Images are only supported with Gemini models. Please switch to a Gemini model to use image analysis.",
+                    reference=message,
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+                return
             
-            final_user_text = f"{get_vietnam_timestamp()}{final_user_text}"
-        payload_messages.append({"role": "user", "content": final_user_text})
+            if is_gemini_live_model(user_model):
+                await message.channel.send(
+                    "🖼️ Images are not supported with Gemini Live models. Please switch to a regular Gemini model for image analysis.",
+                    reference=message,
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+                return
+            
+            logger.info(f"Processing {len(attachment_data['images'])} images with Gemini model: {user_model}")
+
+        # Build final user text with attachments
+        combined_text = ""
+        if attachment_data["text_summary"]:
+            combined_text += attachment_data["text_summary"]
+        if final_user_text:
+            combined_text += final_user_text
+        
+        if not combined_text.strip() and not has_images:
+            await message.channel.send(
+                "Please send a message with your question or attach some files.",
+                reference=message,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            return
+
+        # Build message payload
+        if has_images and is_gemini_model(user_model) and not is_gemini_live_model(user_model):
+            # Use enhanced payload with images for compatible Gemini models
+            payload_messages = await build_message_payload_with_images(
+                user_id, combined_text, attachment_data["images"]
+            )
+        else:
+            # Standard text-only payload
+            payload_messages = [user_system_message]
+            if _memory_store:
+                payload_messages.extend(_memory_store.get_user_messages(user_id))
+                
+                combined_text = f"{get_vietnam_timestamp()}{combined_text}"
+            payload_messages.append({"role": "user", "content": combined_text})
 
         # Stream or regular response
         if is_live:
@@ -801,7 +1025,7 @@ async def process_ai_request(request):
                 
                 # Save to memory store
                 if _memory_store:
-                    _memory_store.add_message(user_id, {"role": "user", "content": final_user_text})
+                    _memory_store.add_message(user_id, {"role": "user", "content": combined_text})
                     _memory_store.add_message(user_id, {"role": "assistant", "content": collected_response})
                     
                 # Deduct credits after successful completion
@@ -809,7 +1033,7 @@ async def process_ai_request(request):
                     await deduct_credits(user_id, model_info.get("credit_cost", 0))
                     
         else:
-            # NON-STREAMING RESPONSE - Use enhanced long message handler
+            # NON-STREAMING RESPONSE - Use enhanced long message handler with image support
             ok, resp = await asyncio.get_event_loop().run_in_executor(
                 None,
                 _call_api.call_openai_proxy,
@@ -823,7 +1047,7 @@ async def process_ai_request(request):
                 
                 # Save to memory store
                 if _memory_store:
-                    _memory_store.add_message(user_id, {"role": "user", "content": final_user_text})
+                    _memory_store.add_message(user_id, {"role": "user", "content": combined_text})
                     _memory_store.add_message(user_id, {"role": "assistant", "content": resp})
                 
                 # Deduct credits after successful completion    
@@ -832,7 +1056,7 @@ async def process_ai_request(request):
             else:
                 error_msg = resp or "Unknown error"
                 await message.channel.send(
-                    f"⚠ Error: {error_msg}",
+                    f"⚠️ Error: {error_msg}",
                     reference=message,
                     allowed_mentions=discord.AllowedMentions.none()
                 )
@@ -869,7 +1093,12 @@ async def help_slash(interaction: discord.Interaction):
         "`/show profile <user>` – Show user configuration.",
         "`/show sys_prompt <user>` - View system prompt.",
         "`/show models` – Show all supported models.",
-        "`/clearmemory <user>` – Clear conversation history."
+        "`/clearmemory <user>` – Clear conversation history.",
+        "",
+        "**🖼️ Image Analysis (Gemini models only):**",
+        "• Attach images (JPG, PNG, GIF, WebP, BMP) with your message",
+        "• Images work with regular Gemini models (not Live models)",
+        "• Max 10MB per image, multiple images supported"
     ]
 
     if is_owner:
@@ -1034,10 +1263,19 @@ async def show_profile_slash(interaction: discord.Interaction, user: discord.Mem
         3: "Ultimate (Level 3)"
     }.get(access_level, f"Unknown (Level {access_level})")
 
+    # Check if model supports images
+    model_features = []
+    if is_gemini_model(model) and not is_gemini_live_model(model):
+        model_features.append("🖼️ Image Analysis")
+    if is_gemini_live_model(model) or "live-preview" in model:
+        model_features.append("⚡ Live Streaming")
+    
+    features_text = f"\n**Features**: {', '.join(model_features)}" if model_features else ""
+
     # Build profile display without system prompt
     lines = [
         f"**Profile for {target_user}:**",
-        f"**Current Model**: {model}",
+        f"**Current Model**: {model}{features_text}",
         f"**Credit Balance**: {credit}",
         f"**Access Level**: {level_desc}",
         "",
@@ -1096,18 +1334,37 @@ async def show_models_slash(interaction: discord.Interaction):
             
             # Add regular models
             for model in all_models:
+                model_name = model.get("model_name", "Unknown")
+                features = []
+                if is_gemini_model(model_name):
+                    if is_gemini_live_model(model_name):
+                        features.append("⚡Live")
+                    else:
+                        features.append("🖼️IMG")
+                
                 combined_models.append({
-                    "name": model.get("model_name", "Unknown"),
+                    "name": model_name,
                     "credit_cost": model.get("credit_cost", 0),
                     "access_level": model.get("access_level", 0),
+                    "features": features
                 })
             
             # Add profile models
             for pmodel in all_pmodels:
+                pmodel_name = pmodel.get("name", "Unknown")
+                base_model = pmodel.get("base_model", "")
+                features = []
+                if is_gemini_model(base_model):
+                    if is_gemini_live_model(base_model):
+                        features.append("⚡Live")
+                    else:
+                        features.append("🖼️IMG")
+                        
                 combined_models.append({
-                    "name": pmodel.get("name", "Unknown"),
+                    "name": pmodel_name,
                     "credit_cost": pmodel.get("credit_cost", 0),
                     "access_level": pmodel.get("access_level", 0),
+                    "features": features
                 })
             
             # Sort all models together
@@ -1121,6 +1378,7 @@ async def show_models_slash(interaction: discord.Interaction):
                 model_name = model["name"]
                 credit_cost = model["credit_cost"]
                 access_level = model["access_level"]
+                features = model["features"]
                 level_names = {0: "Basic", 1: "Advanced", 2: "Premium", 3: "Ultimate"}
                 level_name = level_names.get(access_level, f"Level {access_level}")
                 
@@ -1128,12 +1386,15 @@ async def show_models_slash(interaction: discord.Interaction):
                 if current_level != access_level:
                     models_info.append(f"\n**{level_name} Models:**")
                     current_level = access_level
-                    
-                models_info.append(f"• `{model_name}` - {credit_cost} credits")
+                
+                feature_text = f" {' '.join(features)}" if features else ""
+                models_info.append(f"• `{model_name}` - {credit_cost} credits{feature_text}")
 
             lines = [
                 "**Available AI Models:**",
                 *models_info,
+                "",
+                "**Legend:** 🖼️IMG = Image support, ⚡Live = Live streaming",
                 "",
                 "Use `/set model <model_name>` to change your model."
             ]
@@ -1143,10 +1404,23 @@ async def show_models_slash(interaction: discord.Interaction):
     else:
         # Fallback for file mode
         supported_models = _user_config_manager.get_supported_models()
-        models_list = "\n".join(f"• `{model}`" for model in sorted(supported_models))
+        models_list = []
+        for model in sorted(supported_models):
+            features = []
+            if is_gemini_model(model):
+                if is_gemini_live_model(model):
+                    features.append("⚡Live")
+                else:
+                    features.append("🖼️IMG")
+            
+            feature_text = f" {' '.join(features)}" if features else ""
+            models_list.append(f"• `{model}`{feature_text}")
+            
         lines = [
             "**Supported AI Models:**",
-            models_list,
+            "\n".join(models_list),
+            "",
+            "**Legend:** 🖼️IMG = Image support, ⚡Live = Live streaming",
             "",
             "Use `/set model <model_name>` to change your model."
         ]
@@ -1208,7 +1482,16 @@ async def show_pmodels_slash(interaction: discord.Interaction):
             cost = p.get("credit_cost", 0)
             level = p.get("access_level", 0)
             is_live = "✅" if p.get("is_live") else "❌"
-            lines.append(f"• `{name}` -> {base} (Cost: {cost}, Level: {level}, Live: {is_live})")
+            
+            features = []
+            if is_gemini_model(base):
+                if is_gemini_live_model(base):
+                    features.append("⚡")
+                else:
+                    features.append("🖼️")
+            feature_text = f" {' '.join(features)}" if features else ""
+            
+            lines.append(f"• `{name}` -> {base} (Cost: {cost}, Level: {level}, Live: {is_live}){feature_text}")
     else:
         lines = ["No profile models found."]
         
@@ -1537,7 +1820,7 @@ async def edit_pmodel_slash(interaction: discord.Interaction, name: str, field: 
     await interaction.response.send_message(message)
 
 # ------------------------------------------------------------------
-# on_message listener — central dispatch point
+# on_message listener – central dispatch point
 # ------------------------------------------------------------------
 async def on_message(message: discord.Message):
     try:
@@ -1584,29 +1867,22 @@ async def on_message(message: discord.Message):
         user_text = re.sub(rf"<@!?{_bot.user.id}>", "", content).strip()
 
     # ------------------------------------------------------------------
-    # Handle attachments
+    # Handle attachments with enhanced image support
     # ------------------------------------------------------------------
     attachment_text = ""
     if attachments:
-        files_info = await _read_attachments_as_text(attachments)
-        attach_summary = []
-        for fi in files_info:
-            if fi.get("skipped"):
-                attach_summary.append(f"- {fi['filename']}: SKIPPED ({fi.get('reason')})")
-            else:
-                attach_summary.append(f"- {fi['filename']}: included ({len(fi['text'])} chars)")
-        header = "\n".join(attach_summary) + "\n\n"
-
-        files_combined = ""
-        for fi in files_info:
-            if not fi.get("skipped"):
-                files_combined += f"Filename: {fi['filename']}\n---\n{fi['text']}\n\n"
-        attachment_text = header + files_combined
+        attachment_data = await _read_attachments_enhanced(attachments)
+        attachment_text = attachment_data["text_summary"]
+        
+        # Log image processing
+        if attachment_data["has_images"]:
+            image_count = len([img for img in attachment_data["images"] if not img.get("skipped")])
+            logger.info(f"User {message.author.id} sent {image_count} valid images")
 
     final_user_text = (attachment_text + user_text).strip()
-    if not final_user_text:
+    if not final_user_text and not any(not img.get("skipped") for img in attachment_data.get("images", [])):
         await message.channel.send(
-            "Please send a message (mention me or DM me) with your question.",
+            "Please send a message (mention me or DM me) with your question or attach some files/images.",
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return
@@ -1640,7 +1916,7 @@ async def on_message(message: discord.Message):
         )
 
 # ------------------------------------------------------------------
-# Setup — register commands, listeners, load data (updated for slash commands)
+# Setup – register commands, listeners, load data (updated for slash commands)
 # ------------------------------------------------------------------
 def setup(bot: commands.Bot, call_api_module, config_module):
     global _bot, _call_api, _config, _authorized_users, _memory_store, _user_config_manager, _request_queue
@@ -1725,4 +2001,4 @@ def setup(bot: commands.Bot, call_api_module, config_module):
     else:
         logger.info("on_message listener already registered; not adding again.")
 
-    logger.info("Slash commands registered successfully")
+    logger.info("Slash commands registered successfully with image support")

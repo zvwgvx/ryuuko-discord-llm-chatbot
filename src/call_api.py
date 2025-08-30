@@ -1,7 +1,7 @@
 import logging
 import os
 import asyncio
-from typing import List, Dict, Any, Tuple, Optional, AsyncIterator
+from typing import List, Dict, Any, Tuple, Optional, AsyncIterator, Union
 from openai import OpenAI
 import google.generativeai as genai
 import load_config
@@ -214,9 +214,143 @@ def is_thinking_model(model_name: str) -> bool:
     model_lower = model_name.lower()
     return any(pattern in model_lower for pattern in thinking_patterns)
 
+def process_multimodal_content(content: Union[str, List[Dict]]) -> Union[str, List]:
+    """
+    Process multimodal content for Gemini API
+    
+    Args:
+        content: Either a string or list of content parts (text + images)
+        
+    Returns:
+        Processed content for Gemini API
+    """
+    try:
+        if isinstance(content, str):
+            # Simple text content
+            return content
+            
+        if isinstance(content, list):
+            # Multimodal content - process each part
+            parts = []
+            
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                    
+                part_type = part.get("type", "")
+                
+                if part_type == "text":
+                    # Text part
+                    text_content = part.get("text", "")
+                    if text_content:
+                        parts.append(text_content)
+                        
+                elif part_type == "image":
+                    # Image part - convert to Gemini format
+                    image_data = part.get("image_data", {})
+                    if image_data:
+                        data = image_data.get("data", "")
+                        mime_type = image_data.get("mime_type", "image/jpeg")
+                        
+                        if data:
+                            # Create image part for Gemini
+                            import base64
+                            image_bytes = base64.b64decode(data)
+                            
+                            # Create PIL Image for Gemini
+                            try:
+                                from PIL import Image
+                                import io
+                                
+                                image = Image.open(io.BytesIO(image_bytes))
+                                parts.append(image)
+                                logger.debug(f"Added image to Gemini content: {mime_type}")
+                                
+                            except ImportError:
+                                logger.warning("PIL not available, using raw image data")
+                                # Fallback: use dict format that Gemini accepts
+                                parts.append({
+                                    'mime_type': mime_type,
+                                    'data': data
+                                })
+                            except Exception as e:
+                                logger.error(f"Error processing image: {e}")
+                                continue
+            
+            if parts:
+                return parts
+            else:
+                return "Hello"  # Fallback if no valid parts
+        
+        # Fallback for unknown content type
+        logger.warning(f"Unknown content type: {type(content)}")
+        return str(content) if content else "Hello"
+        
+    except Exception as e:
+        logger.error(f"Error processing multimodal content: {e}")
+        return "Hello"  # Safe fallback
+
+def build_gemini_prompt_multimodal(messages: List[Dict[str, Any]]) -> List:
+    """
+    Build a multimodal prompt for Gemini API that supports images
+    
+    Args:
+        messages: List of message dictionaries with potentially multimodal content
+        
+    Returns:
+        List of content parts for Gemini API
+    """
+    try:
+        # Convert messages to Gemini format
+        contents = []
+        
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            
+            # Skip empty messages
+            if not content:
+                continue
+            
+            # Process system messages differently
+            if role == "system":
+                # System message - add as text instruction
+                if isinstance(content, str):
+                    contents.append(f"System Instructions: {content}")
+                continue
+            
+            # Process user/assistant messages
+            if role in ["user", "assistant"]:
+                processed_content = process_multimodal_content(content)
+                
+                # Add role prefix for context if it's text
+                if isinstance(processed_content, str):
+                    # Add role context for text-only messages
+                    if role == "user":
+                        if i == len(messages) - 1:
+                            # Current request - emphasize
+                            contents.append(f"User (CURRENT REQUEST): {processed_content}")
+                        else:
+                            contents.append(f"User: {processed_content}")
+                    else:  # assistant
+                        contents.append(f"Assistant: {processed_content}")
+                else:
+                    # Multimodal content - add directly
+                    contents.extend(processed_content if isinstance(processed_content, list) else [processed_content])
+        
+        # If no contents, return basic prompt
+        if not contents:
+            return ["Hello"]
+        
+        return contents
+        
+    except Exception as e:
+        logger.error(f"Error building multimodal prompt: {e}")
+        return ["Hello"]
+
 def build_gemini_prompt(messages: List[Dict[str, str]]) -> str:
     """
-    Build a comprehensive prompt from message history
+    Build a comprehensive prompt from message history (text-only version)
     FIXED VERSION: Better context separation and current message emphasis
     """
     prompt_parts = []
@@ -257,6 +391,21 @@ def build_gemini_prompt(messages: List[Dict[str, str]]) -> str:
         return "\n\n".join(prompt_parts)
     
     return "Hello"
+
+def has_multimodal_content(messages: List[Dict[str, Any]]) -> bool:
+    """Check if any message contains multimodal content (images)"""
+    try:
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Check if any part is an image
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image":
+                        return True
+        return False
+    except Exception as e:
+        logger.error(f"Error checking multimodal content: {e}")
+        return False
 
 def create_generation_config(
     temperature: Optional[float] = None,
@@ -497,7 +646,7 @@ async def call_gemini_live_api_stream_async(
         yield f"Live API stream error: {str(e)}"
 
 def call_gemini_api(
-    messages: List[Dict[str, str]], 
+    messages: List[Dict[str, Any]], 
     model: str, 
     is_owner: bool = False,
     temperature: Optional[float] = None,
@@ -508,13 +657,30 @@ def call_gemini_api(
     enable_thinking: bool = True,
     thinking_budget: int = 16000
 ) -> Tuple[bool, str]:
-    """Call Gemini API with enhanced parameter support, tools, and thinking capabilities"""
+    """Call Gemini API with enhanced parameter support, tools, thinking capabilities, and IMAGE SUPPORT"""
     
     # Check if this is a Live API model
     if is_gemini_live_model(model):
-        return call_gemini_live_api_sync(messages, model, is_owner)
+        # Live models don't support images - convert to text-only
+        text_only_messages = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Extract only text parts
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                text_content = " ".join(text_parts)
+                text_only_messages.append({
+                    "role": msg.get("role", "user"),
+                    "content": text_content
+                })
+            else:
+                text_only_messages.append(msg)
+        return call_gemini_live_api_sync(text_only_messages, model, is_owner)
     
-    # Regular Gemini API with enhanced features
+    # Regular Gemini API with enhanced features + IMAGE SUPPORT
     try:
         # Configure API key
         if is_owner and clients.owner_gemini_available:
@@ -526,20 +692,26 @@ def call_gemini_api(
         else:
             return False, clients.gemini_error or "Gemini API not initialized"
 
-        # Try to use new SDK with tools and thinking support
-        generate_content_config = create_gemini_generate_content_config(
-            model=model,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            max_output_tokens=max_output_tokens,
-            enable_tools=enable_tools,
-            enable_thinking=enable_thinking,
-            thinking_budget=thinking_budget
-        )
+        # Check if we have multimodal content
+        has_images = has_multimodal_content(messages)
+        logger.debug(f"Multimodal content detected: {has_images}")
 
-        if generate_content_config and LIVE_API_AVAILABLE:
-            # Use new SDK with enhanced features
+        # Try to use new SDK with tools and thinking support (for text-only)
+        generate_content_config = None
+        if not has_images:  # Only use advanced config for text-only
+            generate_content_config = create_gemini_generate_content_config(
+                model=model,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                max_output_tokens=max_output_tokens,
+                enable_tools=enable_tools,
+                enable_thinking=enable_thinking,
+                thinking_budget=thinking_budget
+            )
+
+        if generate_content_config and LIVE_API_AVAILABLE and not has_images:
+            # Use new SDK with enhanced features (text-only)
             logger.debug("Using enhanced Gemini API with tools and thinking support")
             
             # Create client for new SDK
@@ -568,8 +740,8 @@ def call_gemini_api(
                 return False, "No text content returned from enhanced API"
                 
         else:
-            # Fall back to traditional API
-            logger.debug("Using traditional Gemini API")
+            # Use traditional API (supports images)
+            logger.debug(f"Using traditional Gemini API (images: {has_images})")
             
             # Create generation config
             generation_config = create_generation_config(
@@ -588,11 +760,28 @@ def call_gemini_api(
                 generation_config=generation_config
             )
 
-            # Build prompt and generate response
-            prompt = build_gemini_prompt(messages)
-            logger.debug(f"Traditional Gemini prompt length: {len(prompt)} characters")
+            # Build appropriate prompt based on content type
+            if has_images:
+                # Multimodal content - use new format
+                prompt_content = build_gemini_prompt_multimodal(messages)
+                logger.debug(f"Multimodal Gemini prompt parts: {len(prompt_content)}")
+                
+                # Log image information
+                image_count = 0
+                for part in prompt_content:
+                    if hasattr(part, 'size'):  # PIL Image
+                        image_count += 1
+                    elif isinstance(part, dict) and part.get('mime_type'):
+                        image_count += 1
+                        
+                logger.info(f"Sending {image_count} images to Gemini model")
+            else:
+                # Text-only content - use traditional format
+                prompt_content = build_gemini_prompt(messages)
+                logger.debug(f"Text-only Gemini prompt length: {len(prompt_content)} characters")
             
-            response = model_instance.generate_content(prompt)
+            # Generate content
+            response = model_instance.generate_content(prompt_content)
             
             return extract_gemini_response(response)
 
@@ -604,16 +793,34 @@ def call_gemini_api(
         logger.exception(f"Error calling Gemini API: {e}")
         return False, f"Gemini API error: {str(e)}"
 
-async def call_gemini_api_stream(messages: List[Dict[str, str]], model: str, is_owner: bool = False) -> AsyncIterator[str]:
-    """Stream response from Gemini API with Live API support"""
+async def call_gemini_api_stream(messages: List[Dict[str, Any]], model: str, is_owner: bool = False) -> AsyncIterator[str]:
+    """Stream response from Gemini API with Live API support and IMAGE SUPPORT"""
     
     # Check if this is a Live API model
     if is_gemini_live_model(model):
-        async for chunk in call_gemini_live_api_stream_async(messages, model, is_owner):
+        # Convert multimodal to text-only for Live API
+        text_only_messages = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Extract only text parts
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                text_content = " ".join(text_parts)
+                text_only_messages.append({
+                    "role": msg.get("role", "user"),
+                    "content": text_content
+                })
+            else:
+                text_only_messages.append(msg)
+        
+        async for chunk in call_gemini_live_api_stream_async(text_only_messages, model, is_owner):
             yield chunk
         return
     
-    # Regular Gemini API streaming (unchanged)
+    # Regular Gemini API streaming with IMAGE SUPPORT
     try:
         # Configure API key
         if is_owner and clients.owner_gemini_available:
@@ -624,17 +831,38 @@ async def call_gemini_api_stream(messages: List[Dict[str, str]], model: str, is_
             yield "Gemini API not initialized"
             return
 
+        # Check if we have multimodal content
+        has_images = has_multimodal_content(messages)
+        logger.debug(f"Streaming - Multimodal content detected: {has_images}")
+
         # Create model instance with streaming using original model name
         model_instance = genai.GenerativeModel(
             model_name=model,
             safety_settings=GeminiConfig.DEFAULT_SAFETY_SETTINGS
         )
 
-        # Build prompt
-        prompt = build_gemini_prompt(messages)
+        # Build appropriate prompt based on content type
+        if has_images:
+            # Multimodal content - use new format
+            prompt_content = build_gemini_prompt_multimodal(messages)
+            logger.debug(f"Streaming - Multimodal Gemini prompt parts: {len(prompt_content)}")
+            
+            # Log image information
+            image_count = 0
+            for part in prompt_content:
+                if hasattr(part, 'size'):  # PIL Image
+                    image_count += 1
+                elif isinstance(part, dict) and part.get('mime_type'):
+                    image_count += 1
+                    
+            logger.info(f"Streaming {image_count} images to Gemini model")
+        else:
+            # Text-only content
+            prompt_content = build_gemini_prompt(messages)
+            logger.debug(f"Streaming - Text-only Gemini prompt length: {len(prompt_content)} characters")
         
         # Get streaming response
-        response = model_instance.generate_content(prompt, stream=True)
+        response = model_instance.generate_content(prompt_content, stream=True)
         
         # Convert sync iterator to async
         for chunk in response:
@@ -674,7 +902,7 @@ def is_model_available(model: str) -> Tuple[bool, str]:
         return False, str(e)
 
 def call_openai_proxy(
-    messages: List[Dict[str, str]], 
+    messages: List[Dict[str, Any]], 
     model: str = "gpt-3.5-turbo", 
     is_owner: bool = False,
     # Gemini-specific parameters (ignored for OpenAI models)
@@ -691,7 +919,7 @@ def call_openai_proxy(
     Call OpenAI API or Gemini API based on model type
     
     Args:
-        messages: List of message dictionaries
+        messages: List of message dictionaries (can include multimodal content)
         model: Model name
         is_owner: Whether to use owner privileges
         temperature: Temperature for generation
@@ -726,11 +954,29 @@ def call_openai_proxy(
             )
         else:
             # OpenAI API call (Gemini-specific parameters ignored)
+            # Convert multimodal messages to text-only for OpenAI
+            openai_messages = []
+            for msg in messages:
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    # Extract only text parts for OpenAI
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                    text_content = " ".join(text_parts)
+                    openai_messages.append({
+                        "role": msg.get("role", "user"),
+                        "content": text_content
+                    })
+                else:
+                    openai_messages.append(msg)
+            
             openai_temperature = temperature if temperature is not None else 1.1
             
             response = clients.openai_client.chat.completions.create(
                 model=model,
-                messages=messages,
+                messages=openai_messages,
                 temperature=openai_temperature,
                 timeout=load_config.REQUEST_TIMEOUT
             )
@@ -746,11 +992,11 @@ def call_openai_proxy(
         return False, str(e)
 
 async def call_openai_proxy_stream(
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     model: str = "gpt-3.5-turbo",
     is_owner: bool = False
 ) -> AsyncIterator[str]:
-    """Unified streaming API call handler"""
+    """Unified streaming API call handler with IMAGE SUPPORT"""
     
     # Check model availability
     available, error = is_model_available(model)
@@ -763,12 +1009,29 @@ async def call_openai_proxy_stream(
         async for chunk in call_gemini_live_api_stream_async(messages, model, is_owner):
             yield chunk
     elif is_gemini_model(model):
-        # Use regular Gemini streaming
+        # Use regular Gemini streaming with image support
         async for chunk in call_gemini_api_stream(messages, model, is_owner):
             yield chunk
     else:
-        # Regular non-streaming call for OpenAI
-        ok, response = call_openai_proxy(messages, model, is_owner)
+        # Regular non-streaming call for OpenAI (convert multimodal to text-only)
+        openai_messages = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Extract only text parts for OpenAI
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                text_content = " ".join(text_parts)
+                openai_messages.append({
+                    "role": msg.get("role", "user"),
+                    "content": text_content
+                })
+            else:
+                openai_messages.append(msg)
+        
+        ok, response = call_openai_proxy(openai_messages, model, is_owner)
         if ok:
             yield response
         else:
