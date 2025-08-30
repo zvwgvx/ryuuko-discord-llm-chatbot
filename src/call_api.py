@@ -132,6 +132,14 @@ class GeminiConfig:
         "top_k": 40,
     }
     
+    # New: Tools and thinking configuration for regular Gemini models
+    DEFAULT_TOOLS_CONFIG = {
+        "enable_tools": True,
+        "enable_thinking": True,
+        "thinking_budget": 16000,
+        "media_resolution": "MEDIA_RESOLUTION_MEDIUM"
+    }
+    
     FINISH_REASONS = {
         1: "STOP",
         2: "MAX_TOKENS", 
@@ -139,6 +147,25 @@ class GeminiConfig:
         4: "RECITATION",
         5: "OTHER"
     }
+
+def get_gemini_tools():
+    """Create and return Gemini tools configuration for regular models"""
+    try:
+        if not LIVE_API_AVAILABLE:
+            logger.warning("Google GenAI SDK not available for tools, using basic tools")
+            # Return basic tools that work with google-generativeai
+            return []
+            
+        tools = [
+            types.Tool(url_context=types.UrlContext()),
+            types.Tool(code_execution=types.ToolCodeExecution()),
+            types.Tool(google_search=types.GoogleSearch()),
+        ]
+        logger.debug("Gemini tools configured: URL Context, Code Execution, and Google Search")
+        return tools
+    except Exception as e:
+        logger.error(f"Error creating Gemini tools: {e}")
+        return []
 
 def get_live_api_tools():
     """Create and return Live API tools configuration"""
@@ -174,6 +201,18 @@ def is_gemini_model(model_name: str) -> bool:
     return (model_name.startswith("gemini-") or 
             model_name.startswith("gemma-") or 
             "live-preview" in model_name)
+
+def is_thinking_model(model_name: str) -> bool:
+    """Check if the model supports thinking (reasoning)"""
+    thinking_patterns = [
+        "thinking",
+        "reasoning", 
+        "gemini-2.0-flash-thinking-exp",
+        "gemini-2.5-flash-thinking"
+    ]
+    
+    model_lower = model_name.lower()
+    return any(pattern in model_lower for pattern in thinking_patterns)
 
 def build_gemini_prompt(messages: List[Dict[str, str]]) -> str:
     """
@@ -239,6 +278,59 @@ def create_generation_config(
         config["max_output_tokens"] = max(1, min(32768, max_output_tokens))
     
     return config
+
+def create_gemini_generate_content_config(
+    model: str,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    max_output_tokens: Optional[int] = None,
+    enable_tools: bool = True,
+    enable_thinking: bool = True,
+    thinking_budget: int = 16000
+) -> Optional[Any]:
+    """Create GenerateContentConfig for regular Gemini models with tools and thinking support"""
+    try:
+        if not LIVE_API_AVAILABLE:
+            logger.debug("SDK not available, using traditional generation config")
+            return None
+            
+        # Get tools if enabled
+        tools = get_gemini_tools() if enable_tools else []
+        
+        # Build config parameters
+        config_params = {
+            "temperature": temperature if temperature is not None else 1.1,
+            "media_resolution": GeminiConfig.DEFAULT_TOOLS_CONFIG["media_resolution"]
+        }
+        
+        # Add tools if available
+        if tools:
+            config_params["tools"] = tools
+        
+        # Add thinking config for models that support it
+        if enable_thinking and is_thinking_model(model):
+            config_params["thinking_config"] = types.ThinkingConfig(
+                thinking_budget=thinking_budget
+            )
+            logger.debug(f"Thinking config added for model {model} with budget {thinking_budget}")
+        
+        # Add other parameters if specified
+        if top_p is not None:
+            config_params["top_p"] = max(0.0, min(1.0, top_p))
+        if top_k is not None:
+            config_params["top_k"] = max(1, min(100, top_k))
+        if max_output_tokens is not None:
+            config_params["max_output_tokens"] = max(1, min(32768, max_output_tokens))
+        
+        config = types.GenerateContentConfig(**config_params)
+        logger.debug(f"Created GenerateContentConfig with tools: {len(tools)}, thinking: {enable_thinking and is_thinking_model(model)}")
+        
+        return config
+        
+    except Exception as e:
+        logger.error(f"Error creating GenerateContentConfig: {e}")
+        return None
 
 def extract_gemini_response(response) -> Tuple[bool, str]:
     """Extract text from Gemini response with comprehensive error handling"""
@@ -372,7 +464,7 @@ async def call_gemini_live_api_stream_async(
         config = types.LiveConnectConfig(
             response_modalities=["TEXT"],
             media_resolution="MEDIA_RESOLUTION_LOW",
-            tools=tools if tools else None,  # Only include tools if they exist
+            tools=tools # Only include tools if they exist
         )
         
         # Convert messages to simple prompt
@@ -411,15 +503,18 @@ def call_gemini_api(
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
-    max_output_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = None,
+    enable_tools: bool = True,
+    enable_thinking: bool = True,
+    thinking_budget: int = 16000
 ) -> Tuple[bool, str]:
-    """Call Gemini API with enhanced parameter support and Live API support"""
+    """Call Gemini API with enhanced parameter support, tools, and thinking capabilities"""
     
     # Check if this is a Live API model
     if is_gemini_live_model(model):
         return call_gemini_live_api_sync(messages, model, is_owner)
     
-    # Regular Gemini API (unchanged)
+    # Regular Gemini API with enhanced features
     try:
         # Configure API key
         if is_owner and clients.owner_gemini_available:
@@ -431,30 +526,75 @@ def call_gemini_api(
         else:
             return False, clients.gemini_error or "Gemini API not initialized"
 
-        # Create generation config
-        generation_config = create_generation_config(
+        # Try to use new SDK with tools and thinking support
+        generate_content_config = create_gemini_generate_content_config(
+            model=model,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
-            max_output_tokens=max_output_tokens
-        )
-        
-        logger.debug(f"Gemini generation config: {generation_config}")
-        
-        # Create model instance with original model name
-        model_instance = genai.GenerativeModel(
-            model,
-            safety_settings=GeminiConfig.DEFAULT_SAFETY_SETTINGS,
-            generation_config=generation_config
+            max_output_tokens=max_output_tokens,
+            enable_tools=enable_tools,
+            enable_thinking=enable_thinking,
+            thinking_budget=thinking_budget
         )
 
-        # Build prompt and generate response
-        prompt = build_gemini_prompt(messages)
-        logger.debug(f"Gemini prompt length: {len(prompt)} characters")
-        
-        response = model_instance.generate_content(prompt)
-        
-        return extract_gemini_response(response)
+        if generate_content_config and LIVE_API_AVAILABLE:
+            # Use new SDK with enhanced features
+            logger.debug("Using enhanced Gemini API with tools and thinking support")
+            
+            # Create client for new SDK
+            if is_owner and clients.owner_gemini_available:
+                api_key = load_config.OWNER_GEMINI_API_KEY
+            else:
+                api_key = load_config.CLIENT_GEMINI_API_KEY
+                
+            enhanced_client = live_genai.Client(api_key=api_key)
+            
+            # Build prompt
+            prompt = build_gemini_prompt(messages)
+            logger.debug(f"Enhanced Gemini prompt length: {len(prompt)} characters")
+            
+            # Generate content with enhanced config
+            response = enhanced_client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=generate_content_config
+            )
+            
+            # Extract response text
+            if hasattr(response, 'text') and response.text:
+                return True, response.text.strip()
+            else:
+                return False, "No text content returned from enhanced API"
+                
+        else:
+            # Fall back to traditional API
+            logger.debug("Using traditional Gemini API")
+            
+            # Create generation config
+            generation_config = create_generation_config(
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                max_output_tokens=max_output_tokens
+            )
+            
+            logger.debug(f"Gemini generation config: {generation_config}")
+            
+            # Create model instance with original model name
+            model_instance = genai.GenerativeModel(
+                model,
+                safety_settings=GeminiConfig.DEFAULT_SAFETY_SETTINGS,
+                generation_config=generation_config
+            )
+
+            # Build prompt and generate response
+            prompt = build_gemini_prompt(messages)
+            logger.debug(f"Traditional Gemini prompt length: {len(prompt)} characters")
+            
+            response = model_instance.generate_content(prompt)
+            
+            return extract_gemini_response(response)
 
     except Exception as e:
         error_msg = str(e).lower()
@@ -541,7 +681,11 @@ def call_openai_proxy(
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
-    max_output_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = None,
+    # New Gemini-specific parameters for tools and thinking
+    enable_tools: bool = True,
+    enable_thinking: bool = True,
+    thinking_budget: int = 16000
 ) -> Tuple[bool, str]:
     """
     Call OpenAI API or Gemini API based on model type
@@ -550,10 +694,13 @@ def call_openai_proxy(
         messages: List of message dictionaries
         model: Model name
         is_owner: Whether to use owner privileges
-        temperature: Temperature for generation (Gemini only)
-        top_p: Top-p sampling parameter (Gemini only)
+        temperature: Temperature for generation
+        top_p: Top-p sampling parameter
         top_k: Top-k sampling parameter (Gemini only)  
-        max_output_tokens: Maximum output tokens (Gemini only)
+        max_output_tokens: Maximum output tokens
+        enable_tools: Enable tools for Gemini models
+        enable_thinking: Enable thinking for supported Gemini models
+        thinking_budget: Thinking budget for reasoning models
     
     Returns:
         Tuple of (success: bool, response: str)
@@ -572,9 +719,13 @@ def call_openai_proxy(
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
+                max_output_tokens=max_output_tokens,
+                enable_tools=enable_tools,
+                enable_thinking=enable_thinking,
+                thinking_budget=thinking_budget
             )
         else:
-            # OpenAI API call (parameters like top_k ignored)
+            # OpenAI API call (Gemini-specific parameters ignored)
             openai_temperature = temperature if temperature is not None else 1.1
             
             response = clients.openai_client.chat.completions.create(
