@@ -6,6 +6,7 @@ from openai import OpenAI
 import google.generativeai as genai
 import load_config
 from mongodb_store import get_mongodb_store
+import time
 
 # Add Live API imports
 try:
@@ -16,6 +17,10 @@ except ImportError:
     LIVE_API_AVAILABLE = False
 
 logger = logging.getLogger("call_api")
+
+# Thêm các biến toàn cục cho rate limiting gemini-2.5-pro
+GEMINI_2_5_PRO_MIN_INTERVAL = 12  # seconds
+_LAST_GEMINI_2_5_PRO_REQUEST = 0
 
 class APIClients:
     """Singleton class to manage API clients"""
@@ -655,32 +660,17 @@ def call_gemini_api(
     max_output_tokens: Optional[int] = None,
     enable_tools: bool = True,
     enable_thinking: bool = True,
-    thinking_budget: int = 16000
+    thinking_budget: int = 25000
 ) -> Tuple[bool, str]:
-    """Call Gemini API with enhanced parameter support, tools, thinking capabilities, and IMAGE SUPPORT"""
+    # Thêm delay riêng cho model gemini-2.5-pro
+    if model == "gemini-2.5-pro":
+        global _LAST_GEMINI_2_5_PRO_REQUEST
+        wait_time = GEMINI_2_5_PRO_MIN_INTERVAL - (time.time() - _LAST_GEMINI_2_5_PRO_REQUEST)
+        if wait_time > 0:
+            time.sleep(wait_time)
+        _LAST_GEMINI_2_5_PRO_REQUEST = time.time()
     
-    # Check if this is a Live API model
-    if is_gemini_live_model(model):
-        # Live models don't support images - convert to text-only
-        text_only_messages = []
-        for msg in messages:
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                # Extract only text parts
-                text_parts = []
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        text_parts.append(part.get("text", ""))
-                text_content = " ".join(text_parts)
-                text_only_messages.append({
-                    "role": msg.get("role", "user"),
-                    "content": text_content
-                })
-            else:
-                text_only_messages.append(msg)
-        return call_gemini_live_api_sync(text_only_messages, model, is_owner)
-    
-    # Regular Gemini API with enhanced features + IMAGE SUPPORT
+    # ...existing code...
     try:
         # Configure API key
         if is_owner and clients.owner_gemini_available:
@@ -696,9 +686,9 @@ def call_gemini_api(
         has_images = has_multimodal_content(messages)
         logger.debug(f"Multimodal content detected: {has_images}")
 
-        # Try to use new SDK with tools and thinking support (for text-only)
+        # Try enhanced SDK branch if text-only and SDK available
         generate_content_config = None
-        if not has_images:  # Only use advanced config for text-only
+        if not has_images:
             generate_content_config = create_gemini_generate_content_config(
                 model=model,
                 temperature=temperature,
@@ -711,116 +701,89 @@ def call_gemini_api(
             )
 
         if generate_content_config and LIVE_API_AVAILABLE and not has_images:
-            # Use new SDK with enhanced features (text-only)
             logger.debug("Using enhanced Gemini API with tools and thinking support")
-            
-            # Create client for new SDK
             if is_owner and clients.owner_gemini_available:
                 api_key = load_config.OWNER_GEMINI_API_KEY
             else:
                 api_key = load_config.CLIENT_GEMINI_API_KEY
-                
             enhanced_client = live_genai.Client(api_key=api_key)
-            
-            # Build prompt
             prompt = build_gemini_prompt(messages)
             logger.debug(f"Enhanced Gemini prompt length: {len(prompt)} characters")
-            
-            # Generate content with enhanced config
-            response = enhanced_client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=generate_content_config
-            )
-            
-            # Extract response text
+            attempt = 0
+            max_attempts = 3
+            while attempt < max_attempts:
+                try:
+                    response = enhanced_client.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config=generate_content_config
+                    )
+                    break
+                except Exception as e:
+                    attempt += 1
+                    error_str = str(e)
+                    if "RESOURCE_EXHAUSTED" in error_str:
+                        import re
+                        match = re.search(r"'retryDelay': '(\d+)s'", error_str)
+                        delay = int(match.group(1)) if match else 60
+                        logger.warning(f"Rate limit hit, retrying after {delay} seconds (attempt {attempt}/{max_attempts})")
+                        time.sleep(delay)
+                    else:
+                        raise e
+            if attempt >= max_attempts:
+                return False, "Exceeded maximum retry attempts due to rate limits."
             if hasattr(response, 'text') and response.text:
                 return True, response.text.strip()
             else:
                 return False, "No text content returned from enhanced API"
-                
         else:
             # Use traditional API (supports images)
             logger.debug(f"Using traditional Gemini API (images: {has_images})")
-            
-            # Create generation config
             generation_config = create_generation_config(
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
                 max_output_tokens=max_output_tokens
             )
-            
             logger.debug(f"Gemini generation config: {generation_config}")
-            
-            # Create model instance with original model name
             model_instance = genai.GenerativeModel(
                 model,
                 safety_settings=GeminiConfig.DEFAULT_SAFETY_SETTINGS,
                 generation_config=generation_config
             )
-
-            # Build appropriate prompt based on content type
             if has_images:
-                # Multimodal content - use new format
                 prompt_content = build_gemini_prompt_multimodal(messages)
                 logger.debug(f"Multimodal Gemini prompt parts: {len(prompt_content)}")
-                
-                # Log image information
                 image_count = 0
                 for part in prompt_content:
-                    if hasattr(part, 'size'):  # PIL Image
+                    if hasattr(part, 'size'):
                         image_count += 1
                     elif isinstance(part, dict) and part.get('mime_type'):
                         image_count += 1
-                        
                 logger.info(f"Sending {image_count} images to Gemini model")
             else:
-                # Text-only content - use traditional format
                 prompt_content = build_gemini_prompt(messages)
                 logger.debug(f"Text-only Gemini prompt length: {len(prompt_content)} characters")
-            
-            # Generate content
             response = model_instance.generate_content(prompt_content)
-            
             return extract_gemini_response(response)
-
+            
     except Exception as e:
         error_msg = str(e).lower()
         if any(keyword in error_msg for keyword in ["harm", "safety", "blocked"]):
             return False, "Response blocked by content safety filters. Please rephrase your request."
-        
         logger.exception(f"Error calling Gemini API: {e}")
         return False, f"Gemini API error: {str(e)}"
 
 async def call_gemini_api_stream(messages: List[Dict[str, Any]], model: str, is_owner: bool = False) -> AsyncIterator[str]:
-    """Stream response from Gemini API with Live API support and IMAGE SUPPORT"""
+    # Thêm delay riêng cho model gemini-2.5-pro (dùng await sleep)
+    if model == "gemini-2.5-pro":
+        global _LAST_GEMINI_2_5_PRO_REQUEST
+        wait_time = GEMINI_2_5_PRO_MIN_INTERVAL - (time.time() - _LAST_GEMINI_2_5_PRO_REQUEST)
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+        _LAST_GEMINI_2_5_PRO_REQUEST = time.time()
     
-    # Check if this is a Live API model
-    if is_gemini_live_model(model):
-        # Convert multimodal to text-only for Live API
-        text_only_messages = []
-        for msg in messages:
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                # Extract only text parts
-                text_parts = []
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        text_parts.append(part.get("text", ""))
-                text_content = " ".join(text_parts)
-                text_only_messages.append({
-                    "role": msg.get("role", "user"),
-                    "content": text_content
-                })
-            else:
-                text_only_messages.append(msg)
-        
-        async for chunk in call_gemini_live_api_stream_async(text_only_messages, model, is_owner):
-            yield chunk
-        return
-    
-    # Regular Gemini API streaming with IMAGE SUPPORT
+    # ...existing code...
     try:
         # Configure API key
         if is_owner and clients.owner_gemini_available:
@@ -830,7 +793,7 @@ async def call_gemini_api_stream(messages: List[Dict[str, Any]], model: str, is_
         else:
             yield "Gemini API not initialized"
             return
-
+        
         # Check if we have multimodal content
         has_images = has_multimodal_content(messages)
         logger.debug(f"Streaming - Multimodal content detected: {has_images}")
