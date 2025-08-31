@@ -967,7 +967,6 @@ async def call_openai_proxy_stream(
         return
         
     if is_gemini_live_model(model):
-        # Use Live API streaming
         async for chunk in call_gemini_live_api_stream_async(messages, model, is_owner):
             yield chunk
     elif is_gemini_model(model):
