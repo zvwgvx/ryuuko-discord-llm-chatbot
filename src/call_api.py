@@ -960,8 +960,7 @@ async def call_openai_proxy_stream(
     is_owner: bool = False
 ) -> AsyncIterator[str]:
     """Unified streaming API call handler with IMAGE SUPPORT"""
-    
-    # Check model availability
+
     available, error = is_model_available(model)
     if not available:
         yield error
