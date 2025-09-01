@@ -59,6 +59,8 @@ signal.signal(signal.SIGTERM, signal_handler)
 # Optional: keep a simple on_ready here for early logging (functions.setup doesn't override)
 @bot.event
 async def on_ready():
+    TEST_GUILD_ID = 1405933206720483358
+    await bot.tree.sync(guild=discord.Object(id=TEST_GUILD_ID))
     logger.info(f"Bot is ready: {bot.user} (id={bot.user.id}) pid={os.getpid()}")
     # show registered commands
     try:
