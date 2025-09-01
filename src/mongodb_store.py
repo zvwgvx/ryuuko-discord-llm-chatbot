@@ -639,8 +639,10 @@ class MongoDBStore:
     # PROFILE MODEL METHODS
     # =====================================
     
-    def add_profile_model(self, name: str) -> tuple[bool, str]:
-        """Add a new profile model with default values"""
+    def add_profile_model(self, name: str, base_model: str = None, sys_prompt: str = None, 
+                         credit_cost: int = 0, access_level: int = 0, is_live: bool = False,
+                         thinking_budget: int = 0) -> tuple[bool, str]:
+        """Add a new profile model with specified values"""
         try:
             name = name.strip()
             if not name:
@@ -651,21 +653,22 @@ class MongoDBStore:
             if existing:
                 return False, f"Profile model '{name}' already exists"
             
-            # Create profile with default values
+            # Create profile with provided values
             profile = {
                 "name": name,
-                "base_model": None,
-                "sys_prompt": None,
-                "credit_cost": 0,
-                "access_level": 0,
-                "is_live": False,
+                "base_model": base_model,
+                "sys_prompt": sys_prompt,
+                "credit_cost": credit_cost,
+                "access_level": access_level,
+                "is_live": is_live,
+                "thinking_budget": thinking_budget,  # NEW FIELD
                 "created_at": datetime.utcnow()
             }
             
             result = self.db[self.COLLECTIONS['pmodels']].insert_one(profile)
             
             if result.inserted_id:
-                return True, f"Successfully created profile model '{name}'. Use ;edit pmodel to configure settings."
+                return True, f"Successfully created profile model '{name}'"
             return False, "Failed to create profile model"
             
         except Exception as e:
@@ -685,7 +688,8 @@ class MongoDBStore:
                 f"Base Model: `{profile.get('base_model') or 'Not set'}`",
                 f"Cost: {profile.get('credit_cost', 0)} credits",
                 f"Level: {profile.get('access_level', 0)}",
-                f"Live: {'✅' if profile.get('is_live') else '❌'}"
+                f"Live: {'✅' if profile.get('is_live') else '❌'}",
+                f"Thinking Budget: {profile.get('thinking_budget', 0)}"  # NEW FIELD DISPLAY
             ]
             
             # Add system prompt at the end
@@ -712,7 +716,7 @@ class MongoDBStore:
                 return False, f"Profile model '{name}' does not exist"
             
             # Validate field
-            valid_fields = ["base_model", "sys_prompt", "credit_cost", "access_level", "is_live"]
+            valid_fields = ["base_model", "sys_prompt", "credit_cost", "access_level", "is_live", "thinking_budget"]  # ADDED thinking_budget
             if field not in valid_fields:
                 return False, f"Invalid field '{field}'. Valid fields: {', '.join(valid_fields)}"
             
@@ -720,15 +724,15 @@ class MongoDBStore:
             if field == "base_model":
                 # Remove model existence check - allow any model name
                 pass
-            elif field in ["credit_cost", "access_level"]:
+            elif field in ["credit_cost", "access_level", "thinking_budget"]:  # ADDED thinking_budget
                 try:
                     value = int(value)
                     if field == "access_level" and value not in [0, 1, 2, 3]:
                         return False, "Access level must be 0, 1, 2, or 3"
-                    if field == "credit_cost" and value < 0:
-                        return False, "Credit cost cannot be negative"
+                    if field in ["credit_cost", "thinking_budget"] and value < 0:  # ADDED thinking_budget validation
+                        return False, f"{field.replace('_', ' ').title()} cannot be negative"
                 except ValueError:
-                    return False, f"{field} must be an integer"
+                    return False, f"{field.replace('_', ' ').title()} must be an integer"
             elif field == "is_live":
                 value = str(value).lower() in ['true', '1', 'yes']
             
@@ -744,7 +748,7 @@ class MongoDBStore:
             )
             
             if result.modified_count > 0:
-                return True, f"Successfully updated {field} for profile model '{name}'"
+                return True, f"Successfully updated {field.replace('_', ' ')} for profile model '{name}'"
             return False, "No changes were made"
             
         except Exception as e:
