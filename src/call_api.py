@@ -1,12 +1,11 @@
-import logging
-import os
 import asyncio
 from typing import List, Dict, Any, Tuple, Optional, AsyncIterator, Union
 from openai import OpenAI
 import google.generativeai as genai
 import load_config
 from mongodb_store import get_mongodb_store
-import time
+from ratelimit import get_rate_limiter
+import logging
 
 # Add Live API imports
 try:
@@ -17,10 +16,6 @@ except ImportError:
     LIVE_API_AVAILABLE = False
 
 logger = logging.getLogger("call_api")
-
-# Thêm các biến toàn cục cho rate limiting gemini-2.5-pro
-GEMINI_2_5_PRO_MIN_INTERVAL = 12  # seconds
-_LAST_GEMINI_2_5_PRO_REQUEST = 0
 
 class APIClients:
     """Singleton class to manage API clients"""
@@ -118,8 +113,9 @@ class APIClients:
             self.live_error = f"Error initializing Live API client: {e}"
             logger.error(self.live_error)
 
-# Global instance
+# Global instances
 clients = APIClients()
+rate_limiter = get_rate_limiter()
 
 class GeminiConfig:
     """Configuration class for Gemini API parameters"""
@@ -553,6 +549,9 @@ async def call_gemini_live_api_async(
         return False, clients.live_error or "Gemini Live API not available"
     
     try:
+        # Apply rate limiting
+        await rate_limiter.wait_if_needed(model)
+        
         # Get Live API tools
         tools = get_live_api_tools()
         
@@ -590,12 +589,21 @@ async def call_gemini_live_api_async(
                 if text := response.text:
                     response_text += text
         
+        # Record successful request
+        rate_limiter.record_request(model)
+        
         if response_text.strip():
             return True, response_text.strip()
         else:
             return False, "No response from Live API"
             
     except Exception as e:
+        # Check if it's a rate limit error
+        retry_delay = await rate_limiter.handle_rate_limit_error(model, e)
+        if retry_delay:
+            await asyncio.sleep(retry_delay)
+            return await call_gemini_live_api_async(messages, model, is_owner)
+        
         logger.exception(f"Error calling Live API: {e}")
         return False, f"Live API error: {str(e)}"
 
@@ -611,6 +619,9 @@ async def call_gemini_live_api_stream_async(
         return
     
     try:
+        # Apply rate limiting
+        await rate_limiter.wait_if_needed(model)
+        
         # Get Live API tools
         tools = get_live_api_tools()
         
@@ -645,8 +656,19 @@ async def call_gemini_live_api_stream_async(
             async for response in turn:
                 if text := response.text:
                     yield text
-                    
+        
+        # Record successful request
+        rate_limiter.record_request(model)
+        
     except Exception as e:
+        # Check if it's a rate limit error  
+        retry_delay = await rate_limiter.handle_rate_limit_error(model, e)
+        if retry_delay:
+            await asyncio.sleep(retry_delay)
+            async for chunk in call_gemini_live_api_stream_async(messages, model, is_owner):
+                yield chunk
+            return
+        
         logger.exception(f"Error in Live API stream: {e}")
         yield f"Live API stream error: {str(e)}"
 
@@ -662,16 +684,11 @@ def call_gemini_api(
     enable_thinking: bool = True,
     thinking_budget: int = 25000
 ) -> Tuple[bool, str]:
-    # Thêm delay riêng cho model gemini-2.5-pro
-    if model == "gemini-2.5-pro":
-        global _LAST_GEMINI_2_5_PRO_REQUEST
-        wait_time = GEMINI_2_5_PRO_MIN_INTERVAL - (time.time() - _LAST_GEMINI_2_5_PRO_REQUEST)
-        if wait_time > 0:
-            time.sleep(wait_time)
-        _LAST_GEMINI_2_5_PRO_REQUEST = time.time()
-    
-    # ...existing code...
+    """Call Gemini API with integrated rate limiting"""
     try:
+        # Apply rate limiting using the rate limiter
+        asyncio.run(rate_limiter.wait_if_needed(model))
+        
         # Configure API key
         if is_owner and clients.owner_gemini_available:
             genai.configure(api_key=load_config.OWNER_GEMINI_API_KEY)
@@ -706,11 +723,16 @@ def call_gemini_api(
                 api_key = load_config.OWNER_GEMINI_API_KEY
             else:
                 api_key = load_config.CLIENT_GEMINI_API_KEY
+                
             enhanced_client = live_genai.Client(api_key=api_key)
             prompt = build_gemini_prompt(messages)
             logger.debug(f"Enhanced Gemini prompt length: {len(prompt)} characters")
+            
+            # Handle rate limiting with retries
+            settings = rate_limiter.get_rate_limit(model)
+            max_attempts = settings["retries"] + 1
             attempt = 0
-            max_attempts = 1
+            
             while attempt < max_attempts:
                 try:
                     response = enhanced_client.models.generate_content(
@@ -721,17 +743,20 @@ def call_gemini_api(
                     break
                 except Exception as e:
                     attempt += 1
-                    error_str = str(e)
-                    if "RESOURCE_EXHAUSTED" in error_str:
-                        import re
-                        match = re.search(r"'retryDelay': '(\d+)s'", error_str)
-                        delay = int(match.group(1)) if match else 60
-                        logger.warning(f"Rate limit hit, retrying after {delay} seconds (attempt {attempt}/{max_attempts})")
-                        time.sleep(delay)
+                    retry_delay = asyncio.run(rate_limiter.handle_rate_limit_error(model, e))
+                    
+                    if retry_delay and attempt < max_attempts:
+                        logger.warning(f"Rate limit hit, retrying after {retry_delay} seconds (attempt {attempt}/{max_attempts})")
+                        asyncio.run(asyncio.sleep(retry_delay))
                     else:
                         raise e
+                        
             if attempt >= max_attempts:
                 return False, "Exceeded maximum retry attempts due to rate limits."
+                
+            # Record successful request
+            rate_limiter.record_request(model)
+            
             if hasattr(response, 'text') and response.text:
                 return True, response.text.strip()
             else:
@@ -746,11 +771,13 @@ def call_gemini_api(
                 max_output_tokens=max_output_tokens
             )
             logger.debug(f"Gemini generation config: {generation_config}")
+            
             model_instance = genai.GenerativeModel(
                 model,
                 safety_settings=GeminiConfig.DEFAULT_SAFETY_SETTINGS,
                 generation_config=generation_config
             )
+            
             if has_images:
                 prompt_content = build_gemini_prompt_multimodal(messages)
                 logger.debug(f"Multimodal Gemini prompt parts: {len(prompt_content)}")
@@ -764,7 +791,12 @@ def call_gemini_api(
             else:
                 prompt_content = build_gemini_prompt(messages)
                 logger.debug(f"Text-only Gemini prompt length: {len(prompt_content)} characters")
+            
             response = model_instance.generate_content(prompt_content)
+            
+            # Record successful request
+            rate_limiter.record_request(model)
+            
             return extract_gemini_response(response)
             
     except Exception as e:
@@ -775,16 +807,11 @@ def call_gemini_api(
         return False, f"Gemini API error: {str(e)}"
 
 async def call_gemini_api_stream(messages: List[Dict[str, Any]], model: str, is_owner: bool = False) -> AsyncIterator[str]:
-    # Thêm delay riêng cho model gemini-2.5-pro (dùng await sleep)
-    if model == "gemini-2.5-pro":
-        global _LAST_GEMINI_2_5_PRO_REQUEST
-        wait_time = GEMINI_2_5_PRO_MIN_INTERVAL - (time.time() - _LAST_GEMINI_2_5_PRO_REQUEST)
-        if wait_time > 0:
-            await asyncio.sleep(wait_time)
-        _LAST_GEMINI_2_5_PRO_REQUEST = time.time()
-    
-    # ...existing code...
+    """Stream Gemini API calls with integrated rate limiting"""
     try:
+        # Apply rate limiting
+        await rate_limiter.wait_if_needed(model)
+        
         # Configure API key
         if is_owner and clients.owner_gemini_available:
             genai.configure(api_key=load_config.OWNER_GEMINI_API_KEY)
@@ -827,6 +854,9 @@ async def call_gemini_api_stream(messages: List[Dict[str, Any]], model: str, is_
         # Get streaming response
         response = model_instance.generate_content(prompt_content, stream=True)
         
+        # Record successful request
+        rate_limiter.record_request(model)
+        
         # Convert sync iterator to async
         for chunk in response:
             if chunk.text:
@@ -834,6 +864,14 @@ async def call_gemini_api_stream(messages: List[Dict[str, Any]], model: str, is_
             await asyncio.sleep(0)  # Allow other coroutines to run
 
     except Exception as e:
+        # Handle rate limit errors
+        retry_delay = await rate_limiter.handle_rate_limit_error(model, e)
+        if retry_delay:
+            await asyncio.sleep(retry_delay)
+            async for chunk in call_gemini_api_stream(messages, model, is_owner):
+                yield chunk
+            return
+            
         logger.exception(f"Error in Gemini stream: {e}")
         yield f"Stream error: {str(e)}"
 
@@ -959,7 +997,7 @@ async def call_openai_proxy_stream(
     model: str = "gpt-3.5-turbo",
     is_owner: bool = False
 ) -> AsyncIterator[str]:
-    """Unified streaming API call handler with IMAGE SUPPORT"""
+    """Unified streaming API call handler with IMAGE SUPPORT and integrated rate limiting"""
 
     available, error = is_model_available(model)
     if not available:
