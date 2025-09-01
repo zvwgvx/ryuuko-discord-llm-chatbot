@@ -1799,8 +1799,7 @@ async def edit_model_slash(interaction: discord.Interaction, model_name: str, cr
     app_commands.Choice(name="sys_prompt", value="sys_prompt"),
     app_commands.Choice(name="credit_cost", value="credit_cost"),
     app_commands.Choice(name="access_level", value="access_level"),
-    app_commands.Choice(name="is_live", value="is_live"),
-    app_commands.Choice(name="thinking_budget", value="thinking_budget")  # NEW FIELD
+    app_commands.Choice(name="is_live", value="is_live")
 ])
 async def edit_pmodel_slash(interaction: discord.Interaction, name: str, field: str, value: str):
     """Edit a profile model (owner only)"""
@@ -1819,7 +1818,7 @@ async def edit_pmodel_slash(interaction: discord.Interaction, name: str, field: 
 
     success, message = _mongodb_store.edit_profile_model(name, field, value)
     await interaction.response.send_message(message)
-    
+
 # ------------------------------------------------------------------
 # on_message listener – central dispatch point
 # ------------------------------------------------------------------
