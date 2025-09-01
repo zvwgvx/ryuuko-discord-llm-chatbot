@@ -710,7 +710,7 @@ def call_gemini_api(
             prompt = build_gemini_prompt(messages)
             logger.debug(f"Enhanced Gemini prompt length: {len(prompt)} characters")
             attempt = 0
-            max_attempts = 3
+            max_attempts = 1
             while attempt < max_attempts:
                 try:
                     response = enhanced_client.models.generate_content(

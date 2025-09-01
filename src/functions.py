@@ -721,7 +721,7 @@ def get_vietnam_timestamp() -> str:
     now = datetime.now(vietnam_tz)
     
     formatted_time = now.strftime("%A, %B %d, %Y - %H:%M:%S")
-    return f"Thời Gian hiện tại: {formatted_time} (GMT+7) : "
+    return f"Current time: {formatted_time} (GMT+7) : "
 
 async def deduct_credits(user_id: int, amount: int) -> bool:
     """Deduct credits from user balance"""
@@ -904,8 +904,8 @@ async def process_ai_request(request):
             if _memory_store:
                 payload_messages.extend(_memory_store.get_user_messages(user_id))
                 
-                combined_text = f"{get_vietnam_timestamp()}{combined_text}"
-            payload_messages.append({"role": "user", "content": combined_text})
+                final = f"{get_vietnam_timestamp()}{combined_text}"
+            payload_messages.append({"role": "user", "content": final})
 
         # Stream or regular response
         if is_live:

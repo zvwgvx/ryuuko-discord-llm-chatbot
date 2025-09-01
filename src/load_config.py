@@ -74,6 +74,9 @@ MONGODB_CONNECTION_STRING = env_data.get("MONGODB_CONNECTION_STRING")
 MONGODB_DATABASE_NAME = env_data.get("MONGODB_DATABASE_NAME", "discord_openai_proxy")
 USE_MONGODB = env_data.get("USE_MONGODB", False)
 
+# Thêm cấu hình webhook
+WEBHOOK_URL = env_data.get("WEBHOOK_URL", "")
+
 # Tham số toàn cục
 REQUEST_TIMEOUT = _int_or_default(env_data.get("REQUEST_TIMEOUT"), 100, "REQUEST_TIMEOUT")
 MAX_MSG = _int_or_default(env_data.get("MAX_MSG"), 1900, "MAX_MSG")
